@@ -78,6 +78,20 @@ public:
         return exclude_roadmap_build_time_from_budget_;
     }
 
+    /// Read-only view of one robot's built PRM* roadmap (valid after solve()
+    /// returns). Vertex 0/1 are the query start/goal, per the Roadmap comment
+    /// below.
+    struct RoadmapView {
+        const std::vector<std::vector<double>> &vertices;
+        const std::vector<std::vector<int>> &adjacency;
+        int start_vertex;
+        int goal_vertex;
+    };
+    /// Number of per-robot roadmaps built (equals problem_->numRobots() after solve()).
+    std::size_t numRoadmaps() const { return roadmaps_.size(); }
+    /// Throws std::out_of_range if robot_index >= numRoadmaps().
+    RoadmapView roadmap(std::size_t robot_index) const;
+
     static const char *costMetricName(CostMetric metric);
     static const char *tensorSearchModeName(TensorSearchMode mode);
     static const char *localConnectorModeName(LocalConnectorMode mode);

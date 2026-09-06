@@ -27,6 +27,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -797,6 +798,72 @@ inline void appendArcVisualization(
     trace["solution_found"] =
         last.conflict_scan_completed && last.conflicts.empty();
     result["arc_visualization"] = std::move(trace);
+}
+
+inline bool roadmapsRequested(bool output_paths, bool output_roadmaps) {
+    return output_paths && output_roadmaps;
+}
+
+/// Embeds each sphere robot's dRRT-family planning roadmap (vertices +
+/// deduplicated undirected edges) into result["roadmaps"], opt-in via
+/// --output-roadmaps. No-op for non-dRRT planners (dynamic_pointer_cast
+/// fails) and for non-sphere robots (Roadmap::vertices are raw OMPL configs,
+/// meaningless to the viewer for URDF-based arms). Requires result["robots"]
+/// to already be fully populated by the caller (see appendArcVisualization's
+/// analogous call site convention).
+inline void appendRoadmaps(
+    json &result,
+    const std::shared_ptr<comotion::MultiRobotPlanner> &planner,
+    bool output_paths, bool output_roadmaps) {
+    if (!roadmapsRequested(output_paths, output_roadmaps))
+        return;
+    const auto drrt = std::dynamic_pointer_cast<comotion::MRdRRT>(planner);
+    if (!drrt)
+        return;
+    if (!result.contains("robots") || !result["robots"].is_array())
+        return;
+
+    const auto &robots_json = result["robots"];
+    json roadmaps = json::array();
+    for (std::size_t r = 0; r < drrt->numRoadmaps(); ++r) {
+        if (r >= robots_json.size())
+            break;
+        const auto &robot_json = robots_json[r];
+        if (!robot_json.contains("robot_type") ||
+            robot_json["robot_type"] != "sphere")
+            continue;
+
+        const auto view = drrt->roadmap(r);
+        if (view.vertices.empty())
+            continue;
+
+        // adjacency is a per-vertex adjacency list that lists both
+        // directions of each undirected edge; dedupe via {min, max} pairs
+        // so a naive dump doesn't double every edge.
+        std::set<std::pair<int, int>> unique_edges;
+        for (std::size_t u = 0; u < view.adjacency.size(); ++u) {
+            for (int v : view.adjacency[u]) {
+                const int a = std::min(static_cast<int>(u), v);
+                const int b = std::max(static_cast<int>(u), v);
+                unique_edges.emplace(a, b);
+            }
+        }
+
+        json edges = json::array();
+        for (const auto &edge : unique_edges)
+            edges.push_back({edge.first, edge.second});
+
+        roadmaps.push_back({
+            {"robot_index", static_cast<int>(r)},
+            {"vertices", view.vertices},
+            {"edges", std::move(edges)},
+            {"start_vertex", view.start_vertex},
+            {"goal_vertex", view.goal_vertex},
+        });
+    }
+
+    if (!roadmaps.empty())
+        result["roadmaps"] = std::move(roadmaps);
 }
 
 inline std::string requireValue(int &index, int argc, char **argv,

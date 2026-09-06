@@ -227,6 +227,14 @@ if(COMOTION_BUILD_TESTS)
     target_link_libraries(mr_drrt_metrics_regression PRIVATE comotion)
     add_test(NAME mr_drrt_metrics_regression COMMAND mr_drrt_metrics_regression)
 
+    add_executable(mr_drrt_roadmap_export_regression
+        tests/mr_drrt_roadmap_export_regression.cpp)
+    target_include_directories(mr_drrt_roadmap_export_regression PRIVATE
+        ${PROJECT_SOURCE_DIR}/apps)
+    target_link_libraries(mr_drrt_roadmap_export_regression PRIVATE comotion)
+    add_test(NAME mr_drrt_roadmap_export_regression
+             COMMAND mr_drrt_roadmap_export_regression)
+
     add_executable(stcbs_post_arrival_repro
         tests/stcbs_post_arrival_repro.cpp)
     target_link_libraries(stcbs_post_arrival_repro PRIVATE comotion)

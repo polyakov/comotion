@@ -14,6 +14,7 @@
 #include <functional>
 #include <iterator>
 #include <queue>
+#include <stdexcept>
 
 namespace comotion {
 
@@ -169,6 +170,16 @@ void MRdRRT::buildRoadmaps(
         rm.start_vertex = 0;
         rm.goal_vertex = 1;
     }
+}
+
+MRdRRT::RoadmapView MRdRRT::roadmap(std::size_t robot_index) const {
+    if (robot_index >= roadmaps_.size()) {
+        throw std::out_of_range(
+            "MRdRRT::roadmap: robot_index out of range");
+    }
+    const Roadmap &rm = roadmaps_[robot_index];
+    return RoadmapView{rm.vertices, rm.adjacency, rm.start_vertex,
+                       rm.goal_vertex};
 }
 
 double MRdRRT::compositeDistance(

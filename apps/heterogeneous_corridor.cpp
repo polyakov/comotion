@@ -59,6 +59,7 @@ struct AppOptions {
     std::string output_dir = "benchmarks/results/heterogeneous_corridor";
     bool output_paths = false;
     bool track_arc_history = false;
+    bool output_roadmaps = false;
     bool output_endpoint_paths = false;
     std::optional<std::string> metrics_json_path;
     bool exit_nonzero_without_exact_solution = false;
@@ -525,7 +526,8 @@ void writePathArtifacts(const TrialMetrics &metrics,
                         const std::string &srdf,
                         const std::shared_ptr<comotion::MultiRobotPlanner> &planner = {},
                         bool output_paths = false,
-                        bool track_arc_history = false) {
+                        bool track_arc_history = false,
+                        bool output_roadmaps = false) {
     std::filesystem::create_directories(output_dir);
 
     auto robot_models = problem->robotModelPtrs();
@@ -626,6 +628,7 @@ void writePathArtifacts(const TrialMetrics &metrics,
     common::appendArcVisualization(out, planner, output_paths,
                                    track_arc_history, problem->resolution(),
                                    problem->vmax());
+    common::appendRoadmaps(out, planner, output_paths, output_roadmaps);
 
     writeJson(out,
               output_dir / (basename + "_" + metrics.planner + "_result.json"),
@@ -700,7 +703,8 @@ TrialMetrics runPlanner(const GeneratedScenario &generated,
                                options.output_dir, basename, visual_urdf,
                                collision_urdf, srdf, planner,
                                options.output_paths,
-                               options.track_arc_history);
+                               options.track_arc_history,
+                               options.output_roadmaps);
         } else if (g_app_verbose) {
             std::cout << "No complete path set; skipping path artifacts\n";
         }
@@ -730,6 +734,8 @@ void printUsage(const char *prog) {
         << "  --metrics-json <path>  Write compact trial metrics JSON\n"
         << "  --output-paths         Write visualization result JSON and .pth files\n"
         << "  --track-arc-history    With --output-paths, embed ARC process history\n"
+        << "  --output-roadmaps      With --output-paths, embed each robot's planning\n"
+        << "                         roadmap (dRRT-family algorithms only)\n"
         << "  --output-endpoint-paths Write fake two-state start/goal paths and exit\n"
         << "  --output-dir <dir>     Output directory for path artifacts\n"
         << "      (default: benchmarks/results/heterogeneous_corridor)\n"
@@ -830,6 +836,8 @@ AppOptions parseArgs(int argc, char **argv) {
             options.output_paths = true;
         } else if (arg == "--track-arc-history") {
             options.track_arc_history = true;
+        } else if (arg == "--output-roadmaps") {
+            options.output_roadmaps = true;
         } else if (arg == "--output-endpoint-paths" ||
                    arg == "--output-fake-paths") {
             options.output_endpoint_paths = true;

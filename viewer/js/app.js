@@ -13,6 +13,14 @@ import {
   conflictRobots,
   firstReachedConflict,
 } from "./arc-playback.js";
+import {
+  arcPathLinesNeedRebuild,
+  arcPathPointsForRobot,
+  hasNoTraceableRobots,
+  solutionPathPointsForRobot,
+  traceableRobotIndices,
+} from "./path-lines.js";
+import { roadmapEntries, robotNameForEntry } from "./roadmap-lines.js";
 import { createURDFLoader, loadURDFAsync } from "./urdf-loader.js?v=9";
 
 // Panda 7-DOF joint names (matches planner config order)
@@ -41,11 +49,27 @@ let arcTimeline = [];
 let robotMeshes = [];
 let obstacleMeshes = [];
 let crossSection2DGroup = null;
+/** Dedicated group for the "Show planned paths" static path lines; created once, toggled via .visible. */
+let pathLinesGroup = null;
+/** When true: draw each traceable sphere robot's full path as a static line. */
+let showPlannedPaths = false;
+/** ARC iteration index the path lines currently reflect, or null if unbuilt/not applicable. */
+let pathLinesArcIterationIndex = null;
+/** Dedicated parent group for all per-robot roadmap line groups; created once,
+ * per-robot child sub-groups toggle independently via their own `.visible`. */
+let roadmapLinesGroup = null;
+/** robot_index -> that robot's roadmap THREE.Group (built once per result load). */
+let roadmapGroupsByRobotIndex = new Map();
+/** robot_index -> the shared THREE.LineBasicMaterial for that robot's roadmap edges. */
+let roadmapMaterialsByRobotIndex = new Map();
+/** robot_index -> that robot's color swatch <span> in the roadmap panel. */
+let roadmapSwatchElsByRobotIndex = new Map();
+/** Sanitized roadmap entries for the currently loaded result; static across playback. */
+let currentRoadmapEntries = [];
 let isPlaying = false;
 let playTimerId = null;
 let playbackSpeedMultiplier = 1;
 const PLAY_FPS = 12;
-const ARC_PATH_COLOR = 0xaeb4bb;
 const ARC_CONFLICT_COLOR = 0xd62828;
 const ARC_SOLUTION_COLOR = 0x2f9e44;
 const ARC_GROUP_COLORS = [
@@ -210,7 +234,7 @@ function createRobotSurfaceMaterial(hex, styleKey = robotColorStyleKey(hex)) {
 }
 
 // DOM refs
-let timestepEl, playPauseBtn, sliderEl, playbackModeSelectEl, playbackSpeedSelectEl;
+let timestepEl, playPauseBtn, sliderEl, playbackModeSelectEl, playbackSpeedSelectEl, showPathsCheckboxEl;
 let cameraPanelEl = null;
 
 function fmtNum(v, digits = 4) {
@@ -1211,6 +1235,260 @@ function refreshCrossSection2D() {
   scene.add(group);
 }
 
+/**
+ * Get (creating and adding to the scene on first use) the dedicated group
+ * that holds all "Show planned paths" static line objects. The whole
+ * feature toggles via `pathLinesGroup.visible`; rebuilds clear and
+ * re-populate this group rather than removing/re-adding it.
+ */
+function ensurePathLinesGroup() {
+  if (!pathLinesGroup) {
+    pathLinesGroup = new THREE.Group();
+    pathLinesGroup.name = "planned_paths";
+    pathLinesGroup.visible = showPlannedPaths;
+    scene.add(pathLinesGroup);
+  }
+  return pathLinesGroup;
+}
+
+function clearPathLinesGroupChildren() {
+  if (!pathLinesGroup) return;
+  for (const child of pathLinesGroup.children.slice()) {
+    pathLinesGroup.remove(child);
+    child.geometry?.dispose?.();
+    disposeMaterial(child.material);
+  }
+}
+
+function addPathLine(group, points, colorHex) {
+  if (points.length < 2) return;
+  const vectors = points.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
+  const geometry = new THREE.BufferGeometry().setFromPoints(vectors);
+  const material = new THREE.LineBasicMaterial({ color: colorHex });
+  const line = new THREE.Line(geometry, material);
+  line.frustumCulled = false;
+  group.add(line);
+}
+
+/**
+ * Rebuild every planned-path line from the current result/playback state.
+ * Solution mode traces each sphere robot's full `robot.path`; ARC mode
+ * traces the currently displayed iteration's `iteration.paths[i]` (true for
+ * both the "paths" and "repairs" phases of a frame, since both belong to
+ * the same iteration), always colored by `robotColorHexForIndex`
+ * regardless of the ARC marker's shared-state color.
+ */
+function rebuildPathLines() {
+  if (!resultData) return;
+  const group = ensurePathLinesGroup();
+  clearPathLinesGroupChildren();
+  const robotIndices = traceableRobotIndices(resultData.robots);
+
+  if (playbackMode === "arc") {
+    const frame = arcTimeline[currentTimestep];
+    if (!frame) {
+      pathLinesArcIterationIndex = null;
+      return;
+    }
+    const iteration = resultData.arc_visualization.iterations[frame.iterationIndex];
+    for (const robotIndex of robotIndices) {
+      addPathLine(
+        group,
+        arcPathPointsForRobot(iteration, robotIndex),
+        robotColorHexForIndex(robotIndex)
+      );
+    }
+    pathLinesArcIterationIndex = frame.iterationIndex;
+  } else {
+    for (const robotIndex of robotIndices) {
+      addPathLine(
+        group,
+        solutionPathPointsForRobot(resultData.robots[robotIndex]),
+        robotColorHexForIndex(robotIndex)
+      );
+    }
+    pathLinesArcIterationIndex = null;
+  }
+}
+
+/**
+ * Rebuild path lines only when the displayed ARC iteration has changed
+ * since they were last drawn (not on every timestep tick within it).
+ * No-op in solution mode, where the full path is static across timesteps.
+ */
+function updatePathLinesForTimestep() {
+  if (!showPlannedPaths || !resultData || playbackMode !== "arc") return;
+  const frame = arcTimeline[currentTimestep];
+  if (!frame) return;
+  if (arcPathLinesNeedRebuild(pathLinesArcIterationIndex, frame.iterationIndex)) {
+    rebuildPathLines();
+  }
+}
+
+function setShowPlannedPaths(enabled) {
+  showPlannedPaths = !!enabled;
+  if (showPlannedPaths) rebuildPathLines();
+  if (pathLinesGroup) pathLinesGroup.visible = showPlannedPaths;
+}
+
+function syncShowPathsCheckbox() {
+  if (!showPathsCheckboxEl) return;
+  const disabled = !resultData || hasNoTraceableRobots(resultData.robots);
+  showPathsCheckboxEl.disabled = disabled;
+  showPathsCheckboxEl.title = disabled
+    ? "No sphere robots in this result — planned-path tracing is not supported for articulated-arm paths."
+    : "Draw each sphere robot's full planned path as a static line, in its palette color.";
+}
+
+/**
+ * Roadmap line opacity: subdued relative to the (full-opacity) planned-path
+ * line, so the path visibly "pops" over any roadmap shown at the same time.
+ * Exact value is an implementer's tuning call per the requirements doc.
+ */
+const ROADMAP_LINE_OPACITY = 0.25;
+
+/**
+ * Get (creating and adding to the scene on first use) the parent group that
+ * holds every robot's roadmap sub-group. Mirrors `ensurePathLinesGroup`.
+ */
+function ensureRoadmapLinesGroup() {
+  if (!roadmapLinesGroup) {
+    roadmapLinesGroup = new THREE.Group();
+    roadmapLinesGroup.name = "roadmaps";
+    scene.add(roadmapLinesGroup);
+  }
+  return roadmapLinesGroup;
+}
+
+/** Dispose and remove every per-robot roadmap sub-group (e.g. on new-result load). */
+function clearRoadmapLinesGroupChildren() {
+  roadmapMaterialsByRobotIndex.clear();
+  roadmapGroupsByRobotIndex.clear();
+  if (!roadmapLinesGroup) return;
+  for (const child of roadmapLinesGroup.children.slice()) {
+    roadmapLinesGroup.remove(child);
+    disposeObjectTree(child);
+  }
+}
+
+/**
+ * Build one robot's roadmap sub-group: one thin, subdued THREE.Line per
+ * edge, sharing a single material per robot so a later palette change only
+ * has to update one material's color. No vertex markers are added, per the
+ * requirements doc (the roadmap reads as background structure, not a
+ * separate set of clickable/highlighted nodes) — including none at
+ * start_vertex/goal_vertex.
+ */
+function buildRoadmapGroupForEntry(parentGroup, entry) {
+  const group = new THREE.Group();
+  group.name = `roadmap_robot_${entry.robot_index}`;
+  group.visible = false;
+  const colorHex = robotColorHexForIndex(entry.robot_index);
+  const material = new THREE.LineBasicMaterial({
+    color: colorHex,
+    transparent: true,
+    opacity: ROADMAP_LINE_OPACITY,
+  });
+  for (const [i, j] of entry.edges) {
+    const a = entry.vertices[i];
+    const b = entry.vertices[j];
+    const geometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(a[0], a[1], a[2]),
+      new THREE.Vector3(b[0], b[1], b[2]),
+    ]);
+    const line = new THREE.Line(geometry, material);
+    line.frustumCulled = false;
+    group.add(line);
+  }
+  parentGroup.add(group);
+  roadmapGroupsByRobotIndex.set(entry.robot_index, group);
+  roadmapMaterialsByRobotIndex.set(entry.robot_index, material);
+  return group;
+}
+
+/**
+ * Rebuild every robot's roadmap sub-group from the current result. Roadmap
+ * data is static per robot (the planning structure, not a per-timestep or
+ * per-ARC-iteration artifact), so unlike path lines this only needs to run
+ * once per result load, never on timestep/iteration/playback-mode changes.
+ */
+function rebuildRoadmapGroups() {
+  clearRoadmapLinesGroupChildren();
+  currentRoadmapEntries = roadmapEntries(resultData);
+  if (currentRoadmapEntries.length === 0) return;
+  const parent = ensureRoadmapLinesGroup();
+  for (const entry of currentRoadmapEntries) {
+    buildRoadmapGroupForEntry(parent, entry);
+  }
+}
+
+/** Re-color every built roadmap's material (and panel swatch) to the current palette. */
+function refreshRoadmapColors() {
+  for (const [robotIndex, material] of roadmapMaterialsByRobotIndex) {
+    const colorHex = robotColorHexForIndex(robotIndex);
+    material.color.setHex(colorHex);
+    const swatch = roadmapSwatchElsByRobotIndex.get(robotIndex);
+    if (swatch) {
+      swatch.style.backgroundColor = `#${colorHex.toString(16).padStart(6, "0")}`;
+    }
+  }
+}
+
+/** Remove all rows from the roadmap panel (e.g. before rebuilding on new-result load). */
+function clearRoadmapPanelRows() {
+  const rows = document.getElementById("roadmap-rows");
+  if (rows) rows.replaceChildren();
+  roadmapSwatchElsByRobotIndex.clear();
+}
+
+function addRoadmapPanelRow(entry) {
+  const rows = document.getElementById("roadmap-rows");
+  if (!rows) return;
+  const colorHex = robotColorHexForIndex(entry.robot_index);
+
+  const row = document.createElement("label");
+  row.className = "roadmap-row";
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = false;
+  checkbox.addEventListener("change", (event) => {
+    const group = roadmapGroupsByRobotIndex.get(entry.robot_index);
+    if (group) group.visible = event.target.checked;
+  });
+
+  const swatch = document.createElement("span");
+  swatch.className = "arc-swatch";
+  swatch.style.backgroundColor = `#${colorHex.toString(16).padStart(6, "0")}`;
+
+  const text = document.createElement("span");
+  text.textContent = robotNameForEntry(resultData, entry);
+
+  row.append(checkbox, swatch, text);
+  rows.appendChild(row);
+  roadmapSwatchElsByRobotIndex.set(entry.robot_index, swatch);
+}
+
+/**
+ * Rebuild the roadmap panel from scratch: absent/hidden when there's no
+ * roadmap data in the loaded result (matching `#arc-panel`'s data-presence
+ * behavior), otherwise one row per robot with a roadmap, each checkbox
+ * starting unchecked (no "show all" default).
+ */
+function updateRoadmapPanel() {
+  const panel = document.getElementById("roadmap-panel");
+  if (!panel) return;
+  clearRoadmapPanelRows();
+  if (currentRoadmapEntries.length === 0) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  for (const entry of currentRoadmapEntries) {
+    addRoadmapPanelRow(entry);
+  }
+}
+
 function createRobotLineMaterial(hex, styleKey = robotColorStyleKey(hex)) {
   const material = new THREE.LineBasicMaterial({
     color: hex,
@@ -1497,6 +1775,8 @@ function setRobotColorPalette(paletteId) {
   } else {
     applyRobotPaletteToScene();
   }
+  if (showPlannedPaths) rebuildPathLines();
+  refreshRoadmapColors();
 }
 
 function initRobotPaletteSelect() {
@@ -1674,7 +1954,7 @@ function updateArcPlayback() {
           ? ARC_SOLUTION_COLOR
           : firstConflict
             ? ARC_CONFLICT_COLOR
-            : ARC_PATH_COLOR
+            : robotColorHexForIndex(robotIndex)
       );
     });
   } else {
@@ -1714,6 +1994,7 @@ function updateRobotsForTimestep() {
   else updateSolutionPlayback();
   applyRobotGeometryModeToScene();
   if (showCrossSection2D) refreshCrossSection2D();
+  updatePathLinesForTimestep();
 }
 
 /**
@@ -1865,7 +2146,6 @@ function updateArcPanel() {
       detail.textContent =
         `Saved path set · path timestep ${frame.timestep} of ${frame.phaseEnd} · ` +
         `conflict scan did not complete`;
-      addArcLegendItem(ARC_PATH_COLOR, "unchecked path");
       return;
     }
 
@@ -1885,7 +2165,6 @@ function updateArcPanel() {
       `Path timestep ${frame.timestep} of ${frame.phaseEnd} · ` +
       `${reached} of ${iteration.conflicts.length} conflicts reached` +
       conflictPause;
-    addArcLegendItem(ARC_PATH_COLOR, "advancing");
     iteration.conflicts.forEach((conflict, conflictIndex) => {
       addArcLegendItem(
         ARC_CONFLICT_COLOR,
@@ -1921,8 +2200,6 @@ function syncPlaybackModeControl() {
   const arcOption = playbackModeSelectEl.querySelector('option[value="arc"]');
   if (arcOption) arcOption.disabled = arcTimeline.length === 0;
   playbackModeSelectEl.value = playbackMode;
-  const paletteSelect = document.getElementById("palette-select");
-  if (paletteSelect) paletteSelect.disabled = playbackMode === "arc";
 }
 
 function stopPlayback() {
@@ -1938,6 +2215,10 @@ function setPlaybackMode(mode) {
   currentTimestep = 0;
   syncPlaybackModeControl();
   updateRobotsForTimestep();
+  // Path lines depend on playback mode (full path vs. current ARC iteration);
+  // updateRobotsForTimestep()'s incremental check only catches ARC iteration
+  // changes within a mode, so force a rebuild across a mode switch too.
+  if (showPlannedPaths) rebuildPathLines();
   updateUI();
 }
 
@@ -1952,6 +2233,7 @@ function updateUI() {
     updateArcPanel();
     syncPlaybackModeControl();
     syncCrossSectionToggleButton();
+    syncShowPathsCheckbox();
     return;
   }
   const frameCount = playbackFrameCount();
@@ -1973,6 +2255,7 @@ function updateUI() {
   syncPlaybackModeControl();
   updateArcPanel();
   syncCrossSectionToggleButton();
+  syncShowPathsCheckbox();
 }
 
 /**
@@ -2351,6 +2634,15 @@ async function loadResult(data) {
   syncPlaybackModeControl();
 
   clearCrossSection2DGroup();
+  showPlannedPaths = false;
+  pathLinesArcIterationIndex = null;
+  clearPathLinesGroupChildren();
+  if (pathLinesGroup) pathLinesGroup.visible = false;
+  if (showPathsCheckboxEl) showPathsCheckboxEl.checked = false;
+
+  rebuildRoadmapGroups();
+  updateRoadmapPanel();
+
   obstacleMeshes.forEach((m) => scene.remove(m));
   robotMeshes.forEach((r) => {
     if (r.urdfRobot) scene.remove(r.urdfRobot);
@@ -2512,6 +2804,7 @@ function init() {
   sliderEl = document.getElementById("timestep-slider");
   playbackModeSelectEl = document.getElementById("playback-mode-select");
   playbackSpeedSelectEl = document.getElementById("playback-speed-select");
+  showPathsCheckboxEl = document.getElementById("show-paths-checkbox");
   initRobotPaletteSelect();
 
   document.getElementById("file-input").addEventListener("change", (e) => {
@@ -2563,6 +2856,13 @@ function init() {
   if (crossSectionBtn) {
     syncCrossSectionToggleButton();
     crossSectionBtn.addEventListener("click", toggleCrossSection2DMode);
+  }
+
+  if (showPathsCheckboxEl) {
+    syncShowPathsCheckbox();
+    showPathsCheckboxEl.addEventListener("change", (event) => {
+      setShowPlannedPaths(event.target.checked);
+    });
   }
 
   // URL param ?file=<path-to-result-json>
