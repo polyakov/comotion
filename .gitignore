@@ -13,6 +13,8 @@ results/
 benchmarks/results/
 comotion-results/
 
+**/.venv*/
+
 # Local research artifacts. Published benchmark inputs belong under resources/;
 # generated results and working-paper media stay outside the source release.
 /*.csv

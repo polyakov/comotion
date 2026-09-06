@@ -56,10 +56,18 @@ struct AppOptions {
     double hallway_width = -1.0;
     double hallway_length = -1.0;
     double intersection_width = -1.0;
+    double left_x = -20.0;
+    double right_x = 20.0;
+    double y_min = -20.0;
+    double y_max = 20.0;
+    std::uint32_t scenario_generation_seed = 0;
+    bool scenario_generation_seed_explicit = false;
+    int max_placement_attempts = 10000;
     std::size_t resolution = 128;
     std::string output_dir = "benchmarks/results/mobile_robot_2d_crossing";
     bool output_paths = false;
     bool track_arc_history = false;
+    bool output_roadmaps = false;
     bool output_endpoint_paths = false;
     std::optional<std::string> metrics_json_path;
     bool exit_nonzero_without_exact_solution = false;
@@ -200,6 +208,13 @@ json benchmarkContextJson(const crossing::GeneratedScenario &generated,
     } else if (generated.scenario == crossing::CrossingScenario::Inlet) {
         context["hallway_width"] = generated.hallway_width;
         context["hallway_length"] = generated.hallway_length;
+    } else if (generated.scenario ==
+               crossing::CrossingScenario::RandomCrossing) {
+        context["left_x"] = options.left_x;
+        context["right_x"] = options.right_x;
+        context["y_min"] = options.y_min;
+        context["y_max"] = options.y_max;
+        context["scenario_generation_seed"] = options.scenario_generation_seed;
     }
     return context;
 }
@@ -219,7 +234,8 @@ void writePathArtifacts(const TrialMetrics &metrics,
                         const std::string &basename,
                         const std::shared_ptr<comotion::MultiRobotPlanner> &planner = {},
                         bool output_paths = false,
-                        bool track_arc_history = false) {
+                        bool track_arc_history = false,
+                        bool output_roadmaps = false) {
     std::filesystem::create_directories(output_dir);
 
     auto robot_models = problem->robotModelPtrs();
@@ -304,6 +320,7 @@ void writePathArtifacts(const TrialMetrics &metrics,
     common::appendArcVisualization(out, planner, output_paths,
                                    track_arc_history, problem->resolution(),
                                    problem->vmax());
+    common::appendRoadmaps(out, planner, output_paths, output_roadmaps);
 
     writeJson(out, output_dir / (basename + "_" + metrics.planner + "_result.json"),
               2);
@@ -373,7 +390,8 @@ TrialMetrics runPlanner(
             writePathArtifacts(metrics, generated, problem,
                                artifact_paths, options.output_dir, basename,
                                planner, options.output_paths,
-                               options.track_arc_history);
+                               options.track_arc_history,
+                               options.output_roadmaps);
         } else if (g_app_verbose) {
             std::cout << "No complete path set; skipping path artifacts\n";
         }
@@ -457,7 +475,9 @@ TrialMetrics runParallelArcConflictAblation(
 void printUsage(const char *prog) {
     std::cout
         << "Usage: " << prog
-        << " --scenario <circle|parallel|perpendicular|hallways|adaptive|inlet> "
+        << " --scenario "
+           "<circle|parallel|perpendicular|hallways|adaptive|inlet|random_"
+           "crossing> "
         << "--num-robots <N> [options]\n"
         << "  --algorithm <name>       composite, composite_rrtstar, composite_prmstar, composite_aorrtc, "
         << "cooperative_composite, prioritized, drrt, drrt_star, ao_drrt, arc, ao_arc, "
@@ -477,10 +497,18 @@ void printUsage(const char *prog) {
         << "  --hallway-width <w>      Adaptive/inlet; -1 derives 4*robot radius\n"
         << "  --hallway-length <l>     Inlet only; -1 derives 4*spacing\n"
         << "  --intersection-width <w> Adaptive only; -1 derives 2*hallway width\n"
+        << "  --left-x <x>             Random_crossing only; left line X (default: -20)\n"
+        << "  --right-x <x>            Random_crossing only; right line X (default: 20)\n"
+        << "  --y-min <y>              Random_crossing only; Y sampling lower bound (default: -20)\n"
+        << "  --y-max <y>              Random_crossing only; Y sampling upper bound (default: 20)\n"
+        << "  --scenario-generation-seed <n> Random_crossing only; seeds scenario RNG (default: --seed)\n"
+        << "  --max-placement-attempts <n> Random_crossing only; rejection-sampling retry cap (default: 10000)\n"
         << "  --resolution <n>         Timesteps per second (default: 128)\n"
         << "  --metrics-json <path>    Write compact trial metrics JSON\n"
         << "  --output-paths           Write visualization result JSON and .pth files\n"
         << "  --track-arc-history      With --output-paths, embed ARC process history\n"
+        << "  --output-roadmaps        With --output-paths, embed each robot's planning\n"
+        << "                           roadmap (dRRT-family algorithms only)\n"
         << "  --output-endpoint-paths  Write fake two-state start/goal paths and exit\n"
         << "  --output-dir <dir>       Output directory for path artifacts\n"
         << "      (default: benchmarks/results/mobile_robot_2d_crossing)\n"
@@ -600,6 +628,21 @@ AppOptions parseArgs(int argc, char **argv) {
         } else if (arg == "--intersection-width") {
             options.intersection_width =
                 std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--left-x") {
+            options.left_x = std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--right-x") {
+            options.right_x = std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--y-min") {
+            options.y_min = std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--y-max") {
+            options.y_max = std::stod(requireValue(i, argc, argv, arg));
+        } else if (arg == "--scenario-generation-seed") {
+            options.scenario_generation_seed = static_cast<std::uint32_t>(
+                std::stoul(requireValue(i, argc, argv, arg)));
+            options.scenario_generation_seed_explicit = true;
+        } else if (arg == "--max-placement-attempts") {
+            options.max_placement_attempts =
+                std::stoi(requireValue(i, argc, argv, arg));
         } else if (arg == "--resolution") {
             options.resolution = static_cast<std::size_t>(
                 std::stoul(requireValue(i, argc, argv, arg)));
@@ -609,6 +652,8 @@ AppOptions parseArgs(int argc, char **argv) {
             options.output_paths = true;
         } else if (arg == "--track-arc-history") {
             options.track_arc_history = true;
+        } else if (arg == "--output-roadmaps") {
+            options.output_roadmaps = true;
         } else if (arg == "--output-endpoint-paths" ||
                    arg == "--output-fake-paths") {
             options.output_endpoint_paths = true;
@@ -893,6 +938,9 @@ AppOptions parseArgs(int argc, char **argv) {
                 "--stcbs-occupied-radius must be non-negative");
     }
 
+    if (!options.scenario_generation_seed_explicit)
+        options.scenario_generation_seed = options.seed;
+
     return options;
 }
 
@@ -912,10 +960,19 @@ int main(int argc, char **argv) {
         crossing::InletOptions inlet_options;
         inlet_options.hallway_width = options.hallway_width;
         inlet_options.hallway_length = options.hallway_length;
+        crossing::RandomCrossingOptions random_crossing_options;
+        random_crossing_options.left_x = options.left_x;
+        random_crossing_options.right_x = options.right_x;
+        random_crossing_options.y_min = options.y_min;
+        random_crossing_options.y_max = options.y_max;
+        random_crossing_options.scenario_generation_seed =
+            options.scenario_generation_seed;
+        random_crossing_options.max_placement_attempts =
+            options.max_placement_attempts;
         const auto generated = crossing::generateScenario(
             crossing::parseScenarioName(options.scenario), options.num_robots,
             options.robot_radius, options.spacing, hallway_options,
-            adaptive_options, inlet_options);
+            adaptive_options, inlet_options, random_crossing_options);
         const json context = benchmarkContextJson(generated, options);
 
         auto problem =

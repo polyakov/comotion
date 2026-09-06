@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -33,6 +35,7 @@ enum class CrossingScenario {
     Hallways,
     Adaptive,
     Inlet,
+    RandomCrossing,
 };
 
 struct HallwayOptions {
@@ -49,6 +52,15 @@ struct AdaptiveOptions {
 struct InletOptions {
     double hallway_width = -1.0;
     double hallway_length = -1.0;
+};
+
+struct RandomCrossingOptions {
+    double left_x = -20.0;
+    double right_x = 20.0;
+    double y_min = -20.0;
+    double y_max = 20.0;
+    std::uint32_t scenario_generation_seed = 0;
+    int max_placement_attempts = 10000;
 };
 
 struct GeneratedScenario {
@@ -84,6 +96,8 @@ inline std::string scenarioName(CrossingScenario scenario) {
         return "adaptive";
     case CrossingScenario::Inlet:
         return "inlet";
+    case CrossingScenario::RandomCrossing:
+        return "random_crossing";
     }
     return "unknown";
 }
@@ -101,6 +115,8 @@ inline CrossingScenario parseScenarioName(const std::string &name) {
         return CrossingScenario::Adaptive;
     if (name == "inlet")
         return CrossingScenario::Inlet;
+    if (name == "random_crossing")
+        return CrossingScenario::RandomCrossing;
     throw std::runtime_error("Unknown crossing scenario: " + name);
 }
 
@@ -164,6 +180,11 @@ inline void validateScenarioInputs(CrossingScenario scenario, int num_robots,
         if (num_robots != 2)
             throw std::runtime_error(
                 "--num-robots must be exactly 2 for --scenario inlet");
+    } else if (scenario == CrossingScenario::RandomCrossing) {
+        if (num_robots % 2 != 0 || num_robots < 4)
+            throw std::runtime_error(
+                "--num-robots must be even and at least 4 for --scenario "
+                "random_crossing");
     } else if (num_robots < 4) {
         throw std::runtime_error("--num-robots must be at least 4");
     }
@@ -524,13 +545,97 @@ inline void generateInlet(GeneratedScenario &generated,
         right_obstacle_half_height));
 }
 
+inline void validateRandomCrossingInputs(int num_robots, double left_x,
+                                         double right_x, double y_min,
+                                         double y_max) {
+    if (num_robots % 2 != 0 || num_robots < 4)
+        throw std::runtime_error(
+            "--num-robots must be even and at least 4 for --scenario "
+            "random_crossing");
+    if (left_x == right_x)
+        throw std::runtime_error(
+            "--left-x and --right-x must differ for --scenario "
+            "random_crossing");
+    if (y_max <= y_min)
+        throw std::runtime_error("--y-max must be greater than --y-min");
+}
+
+inline void placeRandomCrossingSet(
+    std::vector<std::vector<double>> &points,
+    const std::vector<bool> &is_left, double left_x, double right_x,
+    double robot_radius, std::mt19937 &rng,
+    std::uniform_real_distribution<double> &dy, int max_placement_attempts) {
+    const int count = static_cast<int>(is_left.size());
+    points.assign(static_cast<std::size_t>(count), std::vector<double>());
+    const double min_dist = 2.0 * robot_radius;
+    const double min_dist_sq = min_dist * min_dist;
+
+    int attempts = 0;
+    int placed = 0;
+    while (placed < count) {
+        if (attempts >= max_placement_attempts)
+            throw std::runtime_error(
+                "random_crossing: could not place non-conflicting initial "
+                "positions within --max-placement-attempts attempts; widen "
+                "--y-min/--y-max range, reduce --num-robots, or reduce "
+                "--robot-radius");
+        ++attempts;
+        const double y = dy(rng);
+        const double x =
+            is_left[static_cast<std::size_t>(placed)] ? left_x : right_x;
+        bool conflict = false;
+        for (int j = 0; j < placed; ++j) {
+            const double dx = points[static_cast<std::size_t>(j)][0] - x;
+            const double ddy = points[static_cast<std::size_t>(j)][1] - y;
+            if (dx * dx + ddy * ddy < min_dist_sq) {
+                conflict = true;
+                break;
+            }
+        }
+        if (conflict)
+            continue;
+        points[static_cast<std::size_t>(placed)] = point(x, y);
+        ++placed;
+    }
+}
+
+inline void generateRandomCrossing(GeneratedScenario &generated,
+                                   const RandomCrossingOptions &options) {
+    validateRandomCrossingInputs(generated.num_robots, options.left_x,
+                                 options.right_x, options.y_min,
+                                 options.y_max);
+
+    std::vector<bool> start_is_left(
+        static_cast<std::size_t>(generated.num_robots));
+    for (int i = 0; i < generated.num_robots; ++i)
+        start_is_left[static_cast<std::size_t>(i)] = (i % 2 == 0);
+
+    std::vector<bool> goal_is_left(
+        static_cast<std::size_t>(generated.num_robots));
+    for (int i = 0; i < generated.num_robots; ++i)
+        goal_is_left[static_cast<std::size_t>(i)] =
+            !start_is_left[static_cast<std::size_t>(i)];
+
+    std::mt19937 rng(options.scenario_generation_seed);
+    std::uniform_real_distribution<double> dy(options.y_min, options.y_max);
+
+    placeRandomCrossingSet(generated.starts, start_is_left, options.left_x,
+                           options.right_x, generated.robot_radius, rng, dy,
+                           options.max_placement_attempts);
+    placeRandomCrossingSet(generated.goals, goal_is_left, options.left_x,
+                           options.right_x, generated.robot_radius, rng, dy,
+                           options.max_placement_attempts);
+}
+
 inline GeneratedScenario generateScenario(CrossingScenario scenario,
                                           int num_robots,
                                           double robot_radius,
                                           double spacing,
                                           HallwayOptions hallway_options = {},
                                           AdaptiveOptions adaptive_options = {},
-                                          InletOptions inlet_options = {}) {
+                                          InletOptions inlet_options = {},
+                                          RandomCrossingOptions
+                                              random_crossing_options = {}) {
     validateScenarioInputs(scenario, num_robots, robot_radius, spacing);
 
     GeneratedScenario generated;
@@ -588,6 +693,8 @@ inline GeneratedScenario generateScenario(CrossingScenario scenario,
         generateAdaptive(generated, adaptive_options);
     } else if (scenario == CrossingScenario::Inlet) {
         generateInlet(generated, inlet_options);
+    } else if (scenario == CrossingScenario::RandomCrossing) {
+        generateRandomCrossing(generated, random_crossing_options);
     }
 
     if (scenario != CrossingScenario::Hallways &&

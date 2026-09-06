@@ -790,6 +790,282 @@ bool checkInletCustomSize() {
     return ok;
 }
 
+bool checkRandomCrossingCommon() {
+    crossing::RandomCrossingOptions options;
+    const auto generated = crossing::generateScenario(
+        crossing::CrossingScenario::RandomCrossing, 8, 1.0, 5.0, {}, {}, {},
+        options);
+    bool ok = checkCommon(generated, 8);
+    ok &= expect(crossing::parseScenarioName("random_crossing") ==
+                     crossing::CrossingScenario::RandomCrossing,
+                 "random_crossing scenario name must parse");
+    ok &= expect(generated.scenario_name == "random_crossing",
+                 "random_crossing scenario name mismatch");
+    return ok;
+}
+
+bool checkRandomCrossingSideAssignment() {
+    crossing::RandomCrossingOptions options;
+    const auto generated = crossing::generateScenario(
+        crossing::CrossingScenario::RandomCrossing, 8, 0.5, 5.0, {}, {}, {},
+        options);
+    bool ok = true;
+    for (int i = 0; i < 8; ++i) {
+        const auto &start = generated.starts[static_cast<std::size_t>(i)];
+        const auto &goal = generated.goals[static_cast<std::size_t>(i)];
+        const double expected_start_x =
+            (i % 2 == 0) ? options.left_x : options.right_x;
+        const double expected_goal_x =
+            (i % 2 == 0) ? options.right_x : options.left_x;
+        ok &= expect(near(start[0], expected_start_x),
+                     "random_crossing start " + std::to_string(i) +
+                         " must be on the round-robin side");
+        ok &= expect(near(goal[0], expected_goal_x),
+                     "random_crossing goal " + std::to_string(i) +
+                         " must be on the opposite side from its own start");
+    }
+    return ok;
+}
+
+bool checkRandomCrossingYRange() {
+    crossing::RandomCrossingOptions options;
+    options.y_min = -3.0;
+    options.y_max = 7.0;
+    const auto generated = crossing::generateScenario(
+        crossing::CrossingScenario::RandomCrossing, 12, 0.3, 5.0, {}, {}, {},
+        options);
+    bool ok = true;
+    for (const auto &p : generated.starts)
+        ok &= expect(p[1] >= options.y_min - 1e-9 &&
+                         p[1] <= options.y_max + 1e-9,
+                     "random_crossing start y must lie within [y_min, y_max]");
+    for (const auto &p : generated.goals)
+        ok &= expect(p[1] >= options.y_min - 1e-9 &&
+                         p[1] <= options.y_max + 1e-9,
+                     "random_crossing goal y must lie within [y_min, y_max]");
+    return ok;
+}
+
+bool checkRandomCrossingNonOverlap() {
+    crossing::RandomCrossingOptions options;
+    options.y_min = -20.0;
+    options.y_max = 20.0;
+    options.scenario_generation_seed = 42;
+    const int num_robots = 16;
+    const double robot_radius = 0.5;
+    const auto generated = crossing::generateScenario(
+        crossing::CrossingScenario::RandomCrossing, num_robots, robot_radius,
+        5.0, {}, {}, {}, options);
+    bool ok = true;
+    const double min_dist = 2.0 * robot_radius;
+    for (std::size_t i = 0; i < generated.starts.size(); ++i) {
+        for (std::size_t j = i + 1; j < generated.starts.size(); ++j) {
+            const double dx = generated.starts[i][0] - generated.starts[j][0];
+            const double dy = generated.starts[i][1] - generated.starts[j][1];
+            const double dist = std::sqrt(dx * dx + dy * dy);
+            ok &= expect(dist >= min_dist - 1e-9,
+                         "random_crossing starts " + std::to_string(i) +
+                             " and " + std::to_string(j) +
+                             " must be non-overlapping");
+        }
+    }
+    for (std::size_t i = 0; i < generated.goals.size(); ++i) {
+        for (std::size_t j = i + 1; j < generated.goals.size(); ++j) {
+            const double dx = generated.goals[i][0] - generated.goals[j][0];
+            const double dy = generated.goals[i][1] - generated.goals[j][1];
+            const double dist = std::sqrt(dx * dx + dy * dy);
+            ok &= expect(dist >= min_dist - 1e-9,
+                         "random_crossing goals " + std::to_string(i) +
+                             " and " + std::to_string(j) +
+                             " must be non-overlapping");
+        }
+    }
+    return ok;
+}
+
+bool checkRandomCrossingCrossSetConflictsAllowed() {
+    // The generation algorithm (generateRandomCrossing /
+    // placeRandomCrossingSet in mobile_robot_2d_crossing_scenarios.hpp)
+    // places goals by calling placeRandomCrossingSet on generated.goals
+    // alone -- the function only ever compares a candidate point against
+    // previously-placed points *within the same call* (i.e. other goals),
+    // and is never given generated.starts to check against. So a start and
+    // a goal are allowed to coincide or lie arbitrarily close together.
+    // We force that here with a y-range narrower than the required
+    // same-set clearance so that, empirically, some start/goal pair (which
+    // is never checked against each other) ends up closer than 2*radius,
+    // while generation still succeeds without throwing.
+    crossing::RandomCrossingOptions options;
+    options.y_min = 0.0;
+    options.y_max = 2.0;
+    options.scenario_generation_seed = 7;
+    options.max_placement_attempts = 200000;
+    const int num_robots = 4;
+    const double robot_radius = 0.5; // min_dist = 1.0, range width = 2.0
+    crossing::GeneratedScenario generated;
+    bool ok = true;
+    try {
+        generated = crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, num_robots,
+            robot_radius, 5.0, {}, {}, {}, options);
+    } catch (const std::runtime_error &e) {
+        return expect(false,
+                       std::string("random_crossing cross-set test setup "
+                                   "unexpectedly threw: ") +
+                           e.what());
+    }
+    const double min_dist = 2.0 * robot_radius;
+    bool found_close_cross_pair = false;
+    for (const auto &s : generated.starts) {
+        for (const auto &g : generated.goals) {
+            const double dx = s[0] - g[0];
+            const double dy = s[1] - g[1];
+            if (std::sqrt(dx * dx + dy * dy) < min_dist) {
+                found_close_cross_pair = true;
+                break;
+            }
+        }
+        if (found_close_cross_pair)
+            break;
+    }
+    ok &= expect(found_close_cross_pair,
+                 "random_crossing must permit a start/goal pair closer than "
+                 "2*robot_radius (no cross-set check should be performed)");
+    return ok;
+}
+
+bool checkRandomCrossingReproducibility() {
+    crossing::RandomCrossingOptions options;
+    options.scenario_generation_seed = 12345;
+    const auto a = crossing::generateScenario(
+        crossing::CrossingScenario::RandomCrossing, 10, 0.5, 5.0, {}, {}, {},
+        options);
+    const auto b = crossing::generateScenario(
+        crossing::CrossingScenario::RandomCrossing, 10, 0.5, 5.0, {}, {}, {},
+        options);
+    bool ok = true;
+    for (std::size_t i = 0; i < a.starts.size(); ++i)
+        ok &= expect(samePoint(a.starts[i], b.starts[i]),
+                     "random_crossing same seed must reproduce identical "
+                     "starts");
+    for (std::size_t i = 0; i < a.goals.size(); ++i)
+        ok &= expect(samePoint(a.goals[i], b.goals[i]),
+                     "random_crossing same seed must reproduce identical "
+                     "goals");
+    return ok;
+}
+
+bool checkRandomCrossingRngStreamContinuation() {
+    // Reproducibility (checkRandomCrossingReproducibility) alone cannot
+    // distinguish "goals continue the same mt19937 stream after starts"
+    // from "goals are drawn from an independently re-seeded stream using
+    // the same seed" -- both would be equally reproducible run-to-run. This
+    // test pins down the actual doc-specified behavior (goals continue the
+    // same stream, not a fresh one) by independently replaying the exact
+    // draw sequence the spec describes -- one rng, num_robots draws for
+    // starts, then num_robots more draws (without reseeding) for goals --
+    // and checking it matches point-for-point. A range wide enough and a
+    // radius small enough relative to it make a placement rejection
+    // vanishingly unlikely, so the replay should need no retries either.
+    crossing::RandomCrossingOptions options;
+    options.y_min = -1000.0;
+    options.y_max = 1000.0;
+    const int num_robots = 8;
+    const double robot_radius = 0.01;
+    options.scenario_generation_seed = 2024;
+    const auto generated = crossing::generateScenario(
+        crossing::CrossingScenario::RandomCrossing, num_robots, robot_radius,
+        5.0, {}, {}, {}, options);
+
+    std::mt19937 rng(options.scenario_generation_seed);
+    std::uniform_real_distribution<double> dy(options.y_min, options.y_max);
+    std::vector<std::vector<double>> expected_starts(
+        static_cast<std::size_t>(num_robots));
+    std::vector<std::vector<double>> expected_goals(
+        static_cast<std::size_t>(num_robots));
+    for (int i = 0; i < num_robots; ++i) {
+        const double y = dy(rng);
+        const bool is_left = (i % 2 == 0);
+        expected_starts[static_cast<std::size_t>(i)] =
+            crossing::point(is_left ? options.left_x : options.right_x, y);
+    }
+    for (int i = 0; i < num_robots; ++i) {
+        const double y = dy(rng);
+        const bool goal_is_left = (i % 2 != 0);
+        expected_goals[static_cast<std::size_t>(i)] =
+            crossing::point(goal_is_left ? options.left_x : options.right_x,
+                            y);
+    }
+
+    bool ok = true;
+    for (int i = 0; i < num_robots; ++i) {
+        ok &= expect(
+            samePoint(generated.starts[static_cast<std::size_t>(i)],
+                      expected_starts[static_cast<std::size_t>(i)]),
+            "random_crossing start " + std::to_string(i) +
+                " must match the replayed continuing-rng draw sequence");
+        ok &= expect(
+            samePoint(generated.goals[static_cast<std::size_t>(i)],
+                      expected_goals[static_cast<std::size_t>(i)]),
+            "random_crossing goal " + std::to_string(i) +
+                " must match the replayed continuing-rng draw sequence "
+                "(i.e. goals must continue the starts' rng stream, not "
+                "reseed)");
+    }
+    return ok;
+}
+
+bool checkRandomCrossingRobotRadiusAffectsClearance() {
+    // Larger robot_radius with the same seed either still succeeds (and
+    // must still satisfy the larger clearance) or deterministically throws
+    // the attempts-exhaustion error; both are acceptable, but the outcome
+    // must be deterministic for fixed inputs.
+    crossing::RandomCrossingOptions options;
+    options.y_min = -20.0;
+    options.y_max = 20.0;
+    options.scenario_generation_seed = 99;
+    options.max_placement_attempts = 10000;
+    const int num_robots = 8;
+    const double robot_radius = 3.0; // large radius, same tight seed/range
+    bool ok = true;
+    bool threw = false;
+    crossing::GeneratedScenario generated;
+    try {
+        generated = crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, num_robots,
+            robot_radius, 5.0, {}, {}, {}, options);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    if (!threw) {
+        const double min_dist = 2.0 * robot_radius;
+        for (std::size_t i = 0; i < generated.starts.size(); ++i) {
+            for (std::size_t j = i + 1; j < generated.starts.size(); ++j) {
+                const double dx =
+                    generated.starts[i][0] - generated.starts[j][0];
+                const double dy =
+                    generated.starts[i][1] - generated.starts[j][1];
+                ok &= expect(std::sqrt(dx * dx + dy * dy) >= min_dist - 1e-9,
+                             "random_crossing larger robot_radius starts "
+                             "must still respect clearance if it succeeds");
+            }
+        }
+    }
+    // Run again to confirm the outcome (success or throw) is deterministic.
+    bool threw_again = false;
+    try {
+        (void)crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, num_robots,
+            robot_radius, 5.0, {}, {}, {}, options);
+    } catch (const std::runtime_error &) {
+        threw_again = true;
+    }
+    ok &= expect(threw == threw_again,
+                 "random_crossing outcome for a given robot_radius/seed "
+                 "must be deterministic");
+    return ok;
+}
+
 bool checkInvalidInputs() {
     bool ok = true;
     try {
@@ -904,6 +1180,97 @@ bool checkInvalidInputs() {
         ok &= expect(false, "inlet endpoint-contact length should throw");
     } catch (const std::runtime_error &) {
     }
+    try {
+        // validateScenarioInputs() now special-cases RandomCrossing (mirroring
+        // its pre-existing Inlet branch) so the doc's combined message is
+        // reachable directly from generateScenario(), not just from
+        // validateRandomCrossingInputs() called later inside
+        // generateRandomCrossing().
+        (void)crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, 5, 0.5, 5.0);
+        ok &= expect(false, "random_crossing odd robot count should throw");
+    } catch (const std::runtime_error &e) {
+        ok &= expect(
+            std::string(e.what()) ==
+                "--num-robots must be even and at least 4 for --scenario "
+                "random_crossing",
+            "random_crossing odd robot count message mismatch");
+    }
+    try {
+        (void)crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, 2, 0.5, 5.0);
+        ok &= expect(false,
+                     "random_crossing robot count below four should throw");
+    } catch (const std::runtime_error &e) {
+        ok &= expect(
+            std::string(e.what()) ==
+                "--num-robots must be even and at least 4 for --scenario "
+                "random_crossing",
+            "random_crossing robot count below four message mismatch");
+    }
+    try {
+        crossing::RandomCrossingOptions options;
+        options.left_x = 3.0;
+        options.right_x = 3.0;
+        (void)crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, 4, 0.5, 5.0, {}, {},
+            {}, options);
+        ok &= expect(false, "random_crossing left_x == right_x should throw");
+    } catch (const std::runtime_error &e) {
+        ok &= expect(std::string(e.what()) ==
+                         "--left-x and --right-x must differ for --scenario "
+                         "random_crossing",
+                     "random_crossing left_x == right_x message mismatch");
+    }
+    try {
+        crossing::RandomCrossingOptions options;
+        options.y_min = 5.0;
+        options.y_max = 5.0;
+        (void)crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, 4, 0.5, 5.0, {}, {},
+            {}, options);
+        ok &= expect(false, "random_crossing y_max == y_min should throw");
+    } catch (const std::runtime_error &e) {
+        ok &= expect(std::string(e.what()) ==
+                         "--y-max must be greater than --y-min",
+                     "random_crossing y_max == y_min message mismatch");
+    }
+    try {
+        crossing::RandomCrossingOptions options;
+        options.y_min = 5.0;
+        options.y_max = -5.0;
+        (void)crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, 4, 0.5, 5.0, {}, {},
+            {}, options);
+        ok &= expect(false, "random_crossing y_max < y_min should throw");
+    } catch (const std::runtime_error &e) {
+        ok &= expect(std::string(e.what()) ==
+                         "--y-max must be greater than --y-min",
+                     "random_crossing y_max < y_min message mismatch");
+    }
+    try {
+        // Over-constrained: 8 robots (4 per side) need pairwise clearance
+        // 2*robot_radius = 2.0 but the whole y range is only 1.0 wide, and
+        // the retry budget is tiny, so placement must exhaust attempts.
+        crossing::RandomCrossingOptions options;
+        options.y_min = 0.0;
+        options.y_max = 1.0;
+        options.max_placement_attempts = 5;
+        (void)crossing::generateScenario(
+            crossing::CrossingScenario::RandomCrossing, 8, 1.0, 5.0, {}, {},
+            {}, options);
+        ok &= expect(false,
+                     "random_crossing over-constrained placement should "
+                     "exhaust --max-placement-attempts");
+    } catch (const std::runtime_error &e) {
+        ok &= expect(
+            std::string(e.what()) ==
+                "random_crossing: could not place non-conflicting initial "
+                "positions within --max-placement-attempts attempts; widen "
+                "--y-min/--y-max range, reduce --num-robots, or reduce "
+                "--robot-radius",
+            "random_crossing attempts-exhaustion message mismatch");
+    }
     return ok;
 }
 
@@ -922,6 +1289,14 @@ int main() {
     ok &= checkObstacleCorridorContactClearance();
     ok &= checkInletDefault();
     ok &= checkInletCustomSize();
+    ok &= checkRandomCrossingCommon();
+    ok &= checkRandomCrossingSideAssignment();
+    ok &= checkRandomCrossingYRange();
+    ok &= checkRandomCrossingNonOverlap();
+    ok &= checkRandomCrossingCrossSetConflictsAllowed();
+    ok &= checkRandomCrossingReproducibility();
+    ok &= checkRandomCrossingRngStreamContinuation();
+    ok &= checkRandomCrossingRobotRadiusAffectsClearance();
     ok &= checkInvalidInputs();
     if (!ok)
         return 1;
