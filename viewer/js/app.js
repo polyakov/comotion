@@ -2134,13 +2134,18 @@ function addArcLegendItem(colorHex, label) {
   legend.appendChild(item);
 }
 
+/**
+ * Small in-header label (below the frame counter) showing whether ARC is
+ * currently detecting or resolving a conflict at the current frame. Was
+ * previously a large, draggable floating box; now a plain inline label,
+ * hidden outside ARC-process playback.
+ */
 function updateArcStageBox(frame) {
-  const box = document.getElementById("arc-stage-box");
   const label = document.getElementById("arc-stage-label");
-  if (!box || !label) return;
+  if (!label) return;
 
   if (playbackMode !== "arc" || !frame) {
-    box.hidden = true;
+    label.hidden = true;
     return;
   }
 
@@ -2154,66 +2159,7 @@ function updateArcStageBox(frame) {
   label.classList.toggle("conflict-detection", !complete && !resolving);
   label.classList.toggle("conflict-resolution", resolving);
   label.classList.toggle("complete", complete);
-  box.hidden = false;
-}
-
-function initArcStageBox() {
-  const box = document.getElementById("arc-stage-box");
-  if (!box) return;
-
-  const toolbar = document.getElementById("toolbar");
-  const initialTop = Math.max(12, (toolbar?.getBoundingClientRect().bottom || 0) + 12);
-  box.style.left = "12px";
-  box.style.top = `${initialTop}px`;
-
-  let drag = null;
-  const clampPosition = (left, top) => ({
-    left: Math.max(0, Math.min(left, window.innerWidth - box.offsetWidth)),
-    top: Math.max(0, Math.min(top, window.innerHeight - box.offsetHeight)),
-  });
-
-  box.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const rect = box.getBoundingClientRect();
-    drag = {
-      pointerId: event.pointerId,
-      offsetX: event.clientX - rect.left,
-      offsetY: event.clientY - rect.top,
-    };
-    box.setPointerCapture(event.pointerId);
-  });
-
-  box.addEventListener("pointermove", (event) => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const position = clampPosition(
-      event.clientX - drag.offsetX,
-      event.clientY - drag.offsetY
-    );
-    box.style.left = `${position.left}px`;
-    box.style.top = `${position.top}px`;
-  });
-
-  const finishDrag = (event) => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    drag = null;
-    if (box.hasPointerCapture(event.pointerId)) {
-      box.releasePointerCapture(event.pointerId);
-    }
-  };
-  box.addEventListener("pointerup", finishDrag);
-  box.addEventListener("pointercancel", finishDrag);
-
-  window.addEventListener("resize", () => {
-    if (box.hidden) return;
-    const rect = box.getBoundingClientRect();
-    const position = clampPosition(rect.left, rect.top);
-    box.style.left = `${position.left}px`;
-    box.style.top = `${position.top}px`;
-  });
+  label.hidden = false;
 }
 
 function updateArcPanel() {
@@ -2905,7 +2851,6 @@ function animate() {
 function init() {
   initScene();
   initCameraPanel();
-  initArcStageBox();
   syncCameraInputsFromOrbit();
 
   timestepEl = document.getElementById("timestep");
