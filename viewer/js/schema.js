@@ -22,6 +22,20 @@ function configAt(robot, t) {
 
 function normalizeArcVisualization(data) {
   const trace = data.arc_visualization;
+  if (
+    trace &&
+    typeof trace === "object" &&
+    Array.isArray(trace.iteration_chunks) &&
+    trace.iteration_chunks.length > 0
+  ) {
+    // Chunked (see comotion-vadim/requirements/viewer_result_chunking.md):
+    // no inline "iterations" yet -- app.js's loadFromUrl() fetches the
+    // manifest's chunk files, splices the reassembled array into
+    // data.arc_visualization.iterations, then calls this function again
+    // to run the same validation/defaulting below on the real data.
+    // Leave the manifest untouched here rather than nulling it out.
+    return;
+  }
   if (!trace || typeof trace !== "object" || !Array.isArray(trace.iterations)) {
     data.arc_visualization = null;
     return;

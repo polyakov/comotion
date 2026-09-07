@@ -59,6 +59,29 @@ both history flags when creating the result:
 Loading the result selects ARC process mode automatically. Use the **Mode**
 selector to switch between the ARC process and final path.
 
+### Large results: chunked ARC history
+
+`--track-arc-history` results scale with both robot count and conflict
+count (each iteration snapshots every robot's full path so far), and can
+exceed the browser's ~512MB single-string limit — at which point the
+viewer cannot load the file **at all**, not just slowly. `vadim/scripts/
+chunk_viewer_result.py` splits an existing `_result.json`'s
+`arc_visualization.iterations` into several sibling chunk files plus a
+small `*.chunked.json` base file carrying a manifest:
+
+```bash
+python3 vadim/scripts/chunk_viewer_result.py path/to/..._ARC_result.json
+```
+
+Non-destructive — the original file is untouched. Load the `.chunked.json`
+file via `?file=...` exactly like any other result; the viewer fetches and
+reassembles the chunks automatically. **Chunked results can only be
+loaded via `?file=`, not the local file picker** — browsers don't allow
+JS to read sibling files from a local file selection, so the file
+picker loads a chunked result with a warning and no ARC-process history.
+See `vadim/requirements/viewer_result_chunking.md` for the full design
+and file format.
+
 ## Planned Paths
 
 Check **Show planned paths** in the toolbar to draw each sphere robot's

@@ -5,7 +5,7 @@
 
 import * as THREE from "three";
 import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
-import { parseResult, configAt } from "./schema.js";
+import { parseResult, normalizeArcVisualization, configAt } from "./schema.js";
 import {
   arcFrameDurationTimesteps,
   buildArcTimeline,
@@ -27,6 +27,11 @@ import {
   conflictSummaryLine,
   conflictDetailLines,
 } from "./conflict-panel.js";
+import {
+  isChunkedArcVisualization,
+  resolveChunkUrl,
+  mergeChunkedIterations,
+} from "./arc-chunking.js";
 import { createURDFLoader, loadURDFAsync } from "./urdf-loader.js?v=9";
 
 // Panda 7-DOF joint names (matches planner config order)
@@ -2817,6 +2822,19 @@ function loadFromFile(file) {
   reader.onload = async (e) => {
     const data = parseResult(e.target.result);
     if (data) {
+      if (isChunkedArcVisualization(data)) {
+        // Sibling chunk files can't be auto-discovered from a local file
+        // selection (browsers don't allow reading other files in the same
+        // folder without an explicit multi-file/directory picker) -- only
+        // loadFromUrl() can fetch and reassemble them. Load anyway (all
+        // the non-ARC-history data is still usable) but warn explicitly
+        // rather than silently falling back to "Solution path" mode.
+        alert(
+          "This result's ARC-process history is chunked and can only be " +
+          "loaded via a ?file= URL, not the file picker. Loading without " +
+          "ARC-process playback."
+        );
+      }
       await loadResult(data);
     } else {
       if (timestepEl) timestepEl.textContent = "Timestep 0 / 0";
@@ -2824,6 +2842,38 @@ function loadFromFile(file) {
     }
   };
   reader.readAsText(file);
+}
+
+/**
+ * Fetch and parse every chunk listed in a chunked result's
+ * arc_visualization.iteration_chunks manifest (in parallel; each chunk is
+ * independently well under the ~512MB single-string ceiling that made the
+ * unchunked file unloadable in the first place), then splice the
+ * reassembled iterations array back into `data` in place. After this,
+ * `data` looks exactly like an unchunked result already does today, so
+ * loadResult()/buildArcTimeline() need no changes at all -- see
+ * comotion-vadim/requirements/viewer_result_chunking.md.
+ */
+async function loadChunkedArcVisualization(data, baseUrl) {
+  const manifest = data.arc_visualization.iteration_chunks;
+  if (timestepEl) {
+    timestepEl.textContent = `Loading ${manifest.length} chunk(s)...`;
+  }
+  const chunkBodies = await Promise.all(
+    manifest.map(async (entry) => {
+      const chunkUrl = resolveChunkUrl(baseUrl, entry.file);
+      const res = await fetch(chunkUrl);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} fetching chunk ${entry.file}`);
+      }
+      return res.json();
+    })
+  );
+  data.arc_visualization.iterations = mergeChunkedIterations(chunkBodies);
+  // parseResult() skipped validation/defaulting for this arc_visualization
+  // (schema.js's normalizeArcVisualization) since there was no inline
+  // "iterations" to validate yet -- run it now that there is.
+  normalizeArcVisualization(data);
 }
 
 /**
@@ -2841,8 +2891,12 @@ async function loadFromUrl(path) {
       throw new Error(`HTTP ${res.status}: ${path}`);
     }
     const data = parseResult(text);
-    if (data) await loadResult(data);
-    else {
+    if (data) {
+      if (isChunkedArcVisualization(data)) {
+        await loadChunkedArcVisualization(data, url);
+      }
+      await loadResult(data);
+    } else {
       if (timestepEl) timestepEl.textContent = "Timestep 0 / 0";
       alert("Invalid or unsupported JSON format.");
     }
