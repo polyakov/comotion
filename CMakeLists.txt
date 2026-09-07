@@ -174,6 +174,23 @@ if(COMOTION_BUILD_TESTS)
     add_test(NAME arc_exact_only_regression
              COMMAND arc_exact_only_regression)
 
+    add_executable(subproblem_record_capture_regression
+        tests/subproblem_record_capture_regression.cpp)
+    target_link_libraries(subproblem_record_capture_regression PRIVATE comotion)
+    add_test(NAME subproblem_record_capture_regression
+             COMMAND subproblem_record_capture_regression)
+
+    if(TARGET mobile_robot_2d_crossing)
+        add_executable(conflict_record_cli_regression
+            tests/conflict_record_cli_regression.cpp)
+        target_link_libraries(conflict_record_cli_regression PRIVATE comotion)
+        target_compile_definitions(conflict_record_cli_regression PRIVATE
+            MOBILE_ROBOT_2D_CROSSING_BINARY="$<TARGET_FILE:mobile_robot_2d_crossing>")
+        add_dependencies(conflict_record_cli_regression mobile_robot_2d_crossing)
+        add_test(NAME conflict_record_cli_regression
+                 COMMAND conflict_record_cli_regression)
+    endif()
+
     add_executable(aorrtc_makespan_regression
         tests/aorrtc_makespan_regression.cpp)
     target_link_libraries(aorrtc_makespan_regression PRIVATE comotion)
