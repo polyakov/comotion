@@ -129,6 +129,34 @@ between **Solution path** and **ARC process** modes. Changing **Palette**
 re-colors any roadmaps already on screen. Loading a new result file rebuilds
 the panel from scratch and resets every checkbox to unchecked.
 
+## Conflicts
+
+For `mobile_robot_2d_crossing` results, loading a result shows a
+**Conflicts** panel (top-left) listing every raw `SubproblemRecord`
+conflict captured for that exact run (same `--num-robots`/`--seed`) by the
+`--conflict-record-dir` flag — see
+`comotion-vadim/requirements/data-collection/subproblem-record-design.md`
+for the record schema and `comotion-vadim/data/conflict-records/` for the
+existing corpus. The panel is absent entirely (not just empty) when the
+loaded result isn't a recognizable `mobile_robot_2d_crossing` run, or when
+no matching conflict-record folder exists for its exact `--num-robots`/
+`--seed` (e.g. a run captured without `--conflict-record-dir`).
+
+Each row is a one-line summary (e.g. `#65 — 17 robots (seed 14,26) @
+t=7377`); clicking it jumps the main timeline to that conflict's
+`conflict_timestep` and shows an expanded detail readout below the list
+(robots involved, seed pair, raw/valid window bounds, run provenance).
+Navigating this way only moves the timestep — it does not switch playback
+mode or highlight the involved robots.
+
+This reads conflict-record JSON files directly from disk via the
+`comotion/vadim` symlink to the sibling `comotion-vadim` repo (naming
+convention: `vadim/data/conflict-records/full-pool/n<N>_seed<S>/
+conflict_<sequence>.json`, matching the same `n<N>_seed<S>` naming
+`outputBasename()` already embeds in every `mobile_robot_2d_crossing`
+result filename) — so this only works when serving from the `comotion/`
+repo root as described above, with that symlink present.
+
 ## Controls
 
 | Key | Action |

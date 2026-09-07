@@ -21,6 +21,12 @@ import {
   traceableRobotIndices,
 } from "./path-lines.js";
 import { roadmapEntries, robotNameForEntry } from "./roadmap-lines.js";
+import {
+  conflictFolderPath,
+  isWellFormedConflictRecord,
+  conflictSummaryLine,
+  conflictDetailLines,
+} from "./conflict-panel.js";
 import { createURDFLoader, loadURDFAsync } from "./urdf-loader.js?v=9";
 
 // Panda 7-DOF joint names (matches planner config order)
@@ -1489,6 +1495,108 @@ function updateRoadmapPanel() {
   }
 }
 
+// Records fetched for the currently-loaded result's conflict-list panel
+// (see js/conflict-panel.js for the schema/derivation this reads).
+let currentConflictRecords = [];
+let selectedConflictRowEl = null;
+
+/**
+ * Fetch conflict_1.json, conflict_2.json, ... from `folder` until the first
+ * one that isn't there or isn't a well-formed conflict-record JSON (e.g. a
+ * 200-OK HTML directory listing instead of a 404, which some static file
+ * servers return) — matches the sequential, gap-free naming the conflict-
+ * collection sweep produces. Capped defensively so a misconfigured server
+ * that always answers 200 can't spin this forever.
+ */
+async function fetchConflictRecordsForFolder(folder) {
+  const MAX_CONFLICTS_PROBED = 5000;
+  const records = [];
+  for (let i = 1; i <= MAX_CONFLICTS_PROBED; i++) {
+    let response;
+    try {
+      response = await fetch(`${folder}conflict_${i}.json`);
+    } catch (err) {
+      break; // network error — folder unreachable, stop rather than retry forever
+    }
+    if (!response.ok) break;
+    let record;
+    try {
+      record = await response.json();
+    } catch (err) {
+      break; // not JSON — treat like "not found"
+    }
+    if (!isWellFormedConflictRecord(record)) break;
+    records.push(record);
+  }
+  return records;
+}
+
+function clearConflictPanelRows() {
+  const rows = document.getElementById("conflict-rows");
+  if (rows) rows.replaceChildren();
+  selectedConflictRowEl = null;
+  const detail = document.getElementById("conflict-detail");
+  if (detail) detail.replaceChildren();
+}
+
+function selectConflictRow(record, rowEl) {
+  if (selectedConflictRowEl) selectedConflictRowEl.classList.remove("selected");
+  rowEl.classList.add("selected");
+  selectedConflictRowEl = rowEl;
+
+  setTimestep(record.seed_conflict.conflict_timestep);
+
+  const detail = document.getElementById("conflict-detail");
+  if (!detail) return;
+  detail.replaceChildren();
+  for (const line of conflictDetailLines(record)) {
+    const p = document.createElement("div");
+    p.textContent = line;
+    detail.appendChild(p);
+  }
+}
+
+function addConflictPanelRow(record) {
+  const rows = document.getElementById("conflict-rows");
+  if (!rows) return;
+  const row = document.createElement("div");
+  row.className = "conflict-row";
+  row.textContent = conflictSummaryLine(record);
+  row.addEventListener("click", () => selectConflictRow(record, row));
+  rows.appendChild(row);
+}
+
+/**
+ * Rebuild the conflict-list panel for the just-loaded result: hidden when
+ * the result isn't a recognizable mobile_robot_2d_crossing run or its
+ * conflict-record folder has nothing in it (e.g. no --conflict-record-dir
+ * capture exists for this exact run), one clickable row per conflict
+ * otherwise — same absent/hidden-by-data-presence idiom as
+ * updateRoadmapPanel().
+ */
+async function updateConflictsPanel() {
+  const panel = document.getElementById("conflicts-panel");
+  if (!panel) return;
+  clearConflictPanelRows();
+  panel.hidden = true;
+  currentConflictRecords = [];
+
+  const folder = conflictFolderPath(resultData);
+  if (!folder) return;
+
+  const loadedForThisResult = resultData;
+  const records = await fetchConflictRecordsForFolder(folder);
+  // The user may have loaded a different result while this was in flight.
+  if (resultData !== loadedForThisResult) return;
+  if (records.length === 0) return;
+
+  currentConflictRecords = records;
+  panel.hidden = false;
+  const header = document.getElementById("conflicts-header");
+  if (header) header.textContent = `Conflicts (${records.length})`;
+  records.forEach(addConflictPanelRow);
+}
+
 function createRobotLineMaterial(hex, styleKey = robotColorStyleKey(hex)) {
   const material = new THREE.LineBasicMaterial({
     color: hex,
@@ -2642,6 +2750,7 @@ async function loadResult(data) {
 
   rebuildRoadmapGroups();
   updateRoadmapPanel();
+  updateConflictsPanel(); // async, fire-and-forget — see guard inside
 
   obstacleMeshes.forEach((m) => scene.remove(m));
   robotMeshes.forEach((r) => {

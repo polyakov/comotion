@@ -65,6 +65,24 @@
     #roadmap-panel[hidden] { display: none; }
     #roadmap-panel h4 { margin: 0 0 6px 0; font-size: 12px; font-weight: 600; color: #555; }
     .roadmap-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; cursor: pointer; }
+    #conflicts-panel {
+      position: fixed; top: 64px; left: 12px; z-index: 10; min-width: 220px; max-width: min(340px, calc(100vw - 24px));
+      max-height: calc(100vh - 100px); overflow-y: auto;
+      font-size: 13px; color: #222; background: rgba(255,255,255,0.94);
+      border: 1px solid #d7d7d7; padding: 9px 12px; border-radius: 6px;
+    }
+    #conflicts-panel[hidden] { display: none; }
+    #conflicts-panel h4 { margin: 0 0 6px 0; font-size: 12px; font-weight: 600; color: #555; }
+    .conflict-row {
+      padding: 4px 6px; cursor: pointer; border-radius: 4px; font-size: 12px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .conflict-row:hover { background: rgba(33,150,243,0.1); }
+    .conflict-row.selected { background: rgba(33,150,243,0.22); font-weight: 600; }
+    #conflict-detail {
+      margin-top: 8px; padding-top: 8px; border-top: 1px solid #e0e0e0;
+      font-size: 11px; color: #444; line-height: 1.5;
+    }
     #arc-stage-box {
       position: fixed; top: 72px; left: 12px; z-index: 20;
       max-width: min(420px, calc(100vw - 24px));
@@ -155,6 +173,11 @@
     <h4>Roadmaps</h4>
     <div id="roadmap-rows"></div>
   </div>
+  <div id="conflicts-panel" hidden>
+    <h4 id="conflicts-header">Conflicts</h4>
+    <div id="conflict-rows"></div>
+    <div id="conflict-detail"></div>
+  </div>
   <div id="help">
     Left/Right: step ±1 | Shift+Left/Right: ±10 | Home/End: first/last | Space: play/pause
     <br />Camera: left-drag tumble · middle zoom · right pan
@@ -192,6 +215,6 @@
     }
   }
   </script>
-  <script type="module" src="js/app.js?v=30"></script>
+  <script type="module" src="js/app.js?v=31"></script>
 </body>
 </html>
