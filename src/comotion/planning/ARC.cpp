@@ -1342,11 +1342,7 @@ nlohmann::json ARC::subproblemRecordsJson(
                  {"raw_window", subproblemRecordWindowJson(record.raw_window,
                                                            true)},
                  {"valid_window",
-                  record.valid_window_found
-                      ? subproblemRecordWindowJson(record.valid_window, true)
-                      : nlohmann::json{
-                            {"found", false},
-                        }},
+                  subproblemRecordWindowJson(record.valid_window, true)},
                  {"validity_search",
                   {
                       {"expansion_count",
@@ -1356,6 +1352,8 @@ nlohmann::json ARC::subproblemRecordsJson(
                   }},
              }},
         };
+        // begin_t/end_t/start_valid/goal_valid/endpoints_valid are
+        // meaningless (default-valued) when found == false, per the schema.
         out["windows"]["valid_window"]["found"] = record.valid_window_found;
         records.push_back(std::move(out));
     }
