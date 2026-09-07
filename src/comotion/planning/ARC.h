@@ -138,6 +138,14 @@ public:
     /// resolveConflictOnPaths -- i.e. before any repair attempt (a1/a3/a4)
     /// touches it. Disabled by default; applications gate this on their own
     /// flag (e.g. --conflict-record-dir).
+    ///
+    /// Unlike RepairAttemptEvent telemetry (always recorded), this defaults
+    /// off because it does real added work per conflict beyond what
+    /// resolution itself needs: an independent findValidWindow() replay
+    /// (its own sequence of MultiRobotProblem rebuilds and composite
+    /// validity checks) plus a per-robot cspace-bounds recomputation, none
+    /// of which the real resolution path would otherwise pay for when
+    /// nobody wants a corpus.
     void setCaptureSubproblemRecords(bool enabled) {
         capture_subproblem_records_ = enabled;
         if (!enabled)
@@ -705,6 +713,32 @@ protected:
                                      std::size_t max_t) {
         return start_t == 0 && max_t > 0 &&
                static_cast<std::size_t>(end_t) >= max_t - 1;
+    }
+
+    // True when nextExpansionWindowAfterAttempt() returned the same window
+    // it was given (`next` == `prev`) as an INTENTIONAL re-attempt at the
+    // same bounds -- CustomMultiplied policy re-emitting an unfinished
+    // multiplier entry -- rather than genuine expansion stagnation. Shared
+    // by the real resolution loop (which can be in either phase) and
+    // findValidWindow() (which is always in the InitialValid phase, so its
+    // main_index_before is unused/irrelevant whenever it calls this).
+    bool isRepeatedCustomWindow(int prev_start_t, std::size_t prev_end_t,
+                                int next_start_t, int next_end_t,
+                                bool used_initial_valid_schedule,
+                                std::size_t initial_valid_index_before,
+                                std::size_t main_index_before) const {
+        if (!(next_start_t == prev_start_t &&
+              static_cast<std::size_t>(next_end_t) == prev_end_t)) {
+            return false;
+        }
+        if (used_initial_valid_schedule) {
+            return initialValidWindowExpansionPolicy() ==
+                       ExpansionPolicy::CustomMultiplied &&
+                   initial_valid_index_before <
+                       initialValidWindowExpansionMultipliers().size();
+        }
+        return expansion_policy_ == ExpansionPolicy::CustomMultiplied &&
+               main_index_before < custom_expansion_multipliers_.size();
     }
 
     // Independently replays ARC's endpoint-validity-check +

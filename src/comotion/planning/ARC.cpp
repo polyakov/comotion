@@ -1053,12 +1053,10 @@ ARC::ValidWindowSearchResult ARC::findValidWindow(
         std::tie(start_t, end_t) = nextExpansionWindowAfterAttempt(
             start_t, end_t, max_t, validity.start_valid, validity.goal_valid,
             state);
-        const bool repeated_custom_window =
-            state.last_expansion_used_initial_valid_schedule &&
-            initialValidWindowExpansionPolicy() ==
-                ExpansionPolicy::CustomMultiplied &&
-            initial_valid_index_before <
-                initialValidWindowExpansionMultipliers().size();
+        const bool repeated_custom_window = isRepeatedCustomWindow(
+            prev_start, prev_end, start_t, end_t,
+            state.last_expansion_used_initial_valid_schedule,
+            initial_valid_index_before, state.main_expansion_index);
         if (start_t == prev_start &&
             static_cast<std::size_t>(end_t) == prev_end &&
             !repeated_custom_window) {
@@ -1145,19 +1143,20 @@ void ARC::captureSubproblemRecord(const SubproblemConflict &conflict,
         entry.global_robot_index = r;
 
         // v1 scope assumption (subproblem-record-design.md): every robot in
-        // mobile_robot_2d_crossing is a 3-DOF comotion::FlyingSphere (one
-        // collision sphere, joints 0..2 = x/y/z workspace bounds). If a
-        // future scenario/app feeds ARC a different robot model with
-        // capture enabled, fail loudly here rather than silently emitting a
-        // wrong-shaped record -- extend this block (and the schema) before
-        // reusing capture for non-FlyingSphere robots.
-        if (robot_instance.model->numJoints() != 3) {
+        // mobile_robot_2d_crossing is a comotion::FlyingSphere (one
+        // collision sphere, joints 0..2 = x/y/z workspace bounds), tagged
+        // RobotFamily::Sphere by its constructor. If a future scenario/app
+        // feeds ARC a different robot model (Panda/UR5/Planar3, see
+        // RobotModel.h) with capture enabled, fail loudly here rather than
+        // silently emitting a wrong-shaped record -- extend this block (and
+        // the schema) before reusing capture for non-FlyingSphere robots.
+        if (robot_instance.model->robotFamily() !=
+            RobotModel::RobotFamily::Sphere) {
             throw std::runtime_error(
-                "ARC subproblem record capture supports only 3-DOF "
-                "FlyingSphere robots (subproblem-record-design.md); robot " +
-                std::to_string(r) + " has " +
-                std::to_string(robot_instance.model->numJoints()) +
-                " joints");
+                "ARC subproblem record capture supports only "
+                "comotion::FlyingSphere robots (RobotFamily::Sphere; "
+                "subproblem-record-design.md); robot " +
+                std::to_string(r) + " is a different robot family");
         }
         const auto spheres = robot_instance.model->getCollisionSpheres(
             std::vector<double>(3, 0.0));
@@ -1774,20 +1773,10 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
                 ++num_main_temporal_expansions_;
             }
         }
-        const bool repeated_custom_window =
-            start_t == prev_start &&
-            static_cast<size_t>(end_t) == prev_end &&
-            ((expansion_schedule_state
-                      .last_expansion_used_initial_valid_schedule &&
-              initialValidWindowExpansionPolicy() ==
-                  ExpansionPolicy::CustomMultiplied &&
-              initial_valid_index_before <
-                  initialValidWindowExpansionMultipliers().size()) ||
-             (!expansion_schedule_state
-                       .last_expansion_used_initial_valid_schedule &&
-              expansion_policy_ == ExpansionPolicy::CustomMultiplied &&
-              main_index_before <
-                  custom_expansion_multipliers_.size()));
+        const bool repeated_custom_window = isRepeatedCustomWindow(
+            prev_start, prev_end, start_t, end_t,
+            expansion_schedule_state.last_expansion_used_initial_valid_schedule,
+            initial_valid_index_before, main_index_before);
         if (start_t == prev_start && static_cast<size_t>(end_t) == prev_end &&
             !repeated_custom_window) {
             current_event.outcome = "expansion_exhausted";
