@@ -74,8 +74,13 @@ python3 vadim/scripts/chunk_viewer_result.py path/to/..._ARC_result.json
 ```
 
 Non-destructive — the original file is untouched. Load the `.chunked.json`
-file via `?file=...` exactly like any other result; the viewer fetches and
-reassembles the chunks automatically. **Chunked results can only be
+file via `?file=...` exactly like any other result. The viewer loads
+chunks **on demand**: only a sliding window of 3 chunks (the one covering
+the current frame, plus one on each side) is ever fetched/resident at
+once, fetched as playback or scrubbing moves and evicted once left
+behind — so opening even a huge episode is near-instant regardless of its
+total chunk count, and scrubbing to any point fetches only what that
+point needs, not everything before it. **Chunked results can only be
 loaded via `?file=`, not the local file picker** — browsers don't allow
 JS to read sibling files from a local file selection, so the file
 picker loads a chunked result with a warning and no ARC-process history.

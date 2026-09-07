@@ -5,7 +5,7 @@
 
 import * as THREE from "three";
 import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
-import { parseResult, normalizeArcVisualization, configAt } from "./schema.js";
+import { parseResult, configAt } from "./schema.js";
 import {
   arcFrameDurationTimesteps,
   buildArcTimeline,
@@ -30,7 +30,9 @@ import {
 import {
   isChunkedArcVisualization,
   resolveChunkUrl,
-  mergeChunkedIterations,
+  chunkIndexForIteration,
+  chunksInWindow,
+  buildArcTimelineFromSummaries,
 } from "./arc-chunking.js";
 import { createURDFLoader, loadURDFAsync } from "./urdf-loader.js?v=9";
 
@@ -80,6 +82,16 @@ let currentRoadmapEntries = [];
 let isPlaying = false;
 let playTimerId = null;
 let playbackSpeedMultiplier = 1;
+/**
+ * On-demand chunk loading state for a chunked ARC-history result (see
+ * comotion-vadim/requirements/viewer_result_chunking.md), or null for an
+ * unchunked result / no ARC history at all. Only a sliding 3-chunk window
+ * (current iteration's chunk ± 1) is ever resident in
+ * resultData.arc_visualization.iterations at once — chunks outside the
+ * window are evicted back to holes in that array as playback/scrubbing
+ * moves, so memory stays bounded regardless of total episode length.
+ */
+let chunkState = null;
 const PLAY_FPS = 12;
 const ARC_CONFLICT_COLOR = 0xd62828;
 const ARC_SOLUTION_COLOR = 0x2f9e44;
@@ -2336,12 +2348,21 @@ function updateUI() {
 }
 
 /**
- * Set timestep and update scene/UI.
+ * Set timestep and update scene/UI. Async because, for a chunked ARC-
+ * history result, the target frame's iteration may not be loaded yet --
+ * ensureIterationLoaded() awaits only the chunk actually needed (its
+ * neighbors are prefetched in the background, not waited on). No-op
+ * delay at all for unchunked results or "Solution path" mode.
  */
-function setTimestep(t) {
+async function setTimestep(t) {
   if (!resultData) return;
   const maxT = Math.max(0, playbackFrameCount() - 1);
-  currentTimestep = Math.max(0, Math.min(t, maxT));
+  const clamped = Math.max(0, Math.min(t, maxT));
+  if (chunkState && playbackMode === "arc") {
+    const frame = arcTimeline[clamped];
+    if (frame) await ensureIterationLoaded(frame.iterationIndex);
+  }
+  currentTimestep = clamped;
   updateRobotsForTimestep();
   updateUI();
 }
@@ -2349,8 +2370,8 @@ function setTimestep(t) {
 /**
  * Step forward/backward.
  */
-function step(delta) {
-  setTimestep(currentTimestep + delta);
+async function step(delta) {
+  await setTimestep(currentTimestep + delta);
 }
 
 function currentFrameDurationTimesteps() {
@@ -2371,7 +2392,7 @@ function currentPlaybackDelayMs() {
 
 function scheduleNextPlaybackStep() {
   if (!isPlaying) return;
-  playTimerId = setTimeout(() => {
+  playTimerId = setTimeout(async () => {
     playTimerId = null;
     if (!isPlaying) return;
     if (currentTimestep >= playbackFrameCount() - 1) {
@@ -2379,7 +2400,10 @@ function scheduleNextPlaybackStep() {
       updateUI();
       return;
     }
-    step(1);
+    // Await so a chunk-boundary fetch (only possible if the background
+    // prefetch from the previous step hasn't finished yet) delays the
+    // *next* scheduled tick rather than racing ahead of loaded data.
+    await step(1);
     scheduleNextPlaybackStep();
   }, currentPlaybackDelayMs());
 }
@@ -2701,11 +2725,40 @@ async function loadFirstUrdfRobotWithSolidColor(assetBase, urdfPaths, colorHex) 
 
 /**
  * Load result and build scene. Loads URDFs when urdf_path is present.
+ *
+ * `sourceUrl` is the base result file's own resolved URL, needed to
+ * resolve sibling chunk filenames — passed by loadFromUrl(), absent from
+ * loadFromFile() (a local file selection has no URL sibling chunks could
+ * be fetched relative to; see the chunked-but-no-sourceUrl branch below).
  */
-async function loadResult(data) {
+async function loadResult(data, sourceUrl = null) {
   stopPlayback();
   resultData = data;
-  arcTimeline = buildArcTimeline(data);
+
+  if (isChunkedArcVisualization(data) && sourceUrl) {
+    const manifest = data.arc_visualization.iteration_chunks;
+    const summaries = data.arc_visualization.iteration_summaries || [];
+    // Sparse: only indices inside the currently-loaded window are ever
+    // populated; ensureIterationLoaded() fills/evicts as playback moves.
+    data.arc_visualization.iterations = new Array(summaries.length);
+    chunkState = {
+      manifest,
+      baseUrl: sourceUrl,
+      loadedChunkIndices: new Set(),
+      inFlight: new Map(),
+    };
+    arcTimeline = buildArcTimelineFromSummaries(summaries);
+  } else {
+    // Either a normal unchunked result, or a chunked one loaded without a
+    // sourceUrl (local file picker) -- the latter has no inline
+    // "iterations" either, so buildArcTimeline() sees no ARC data at all
+    // and falls back to "Solution path" mode, same as any other result
+    // with no --track-arc-history. loadFromFile() already warns the user
+    // explicitly about this rather than leaving it a silent surprise.
+    chunkState = null;
+    arcTimeline = buildArcTimeline(data);
+  }
+
   playbackMode = arcTimeline.length > 0 ? "arc" : "solution";
   currentTimestep = 0;
   syncPlaybackModeControl();
@@ -2807,7 +2860,7 @@ async function loadResult(data) {
     }
   }
 
-  setTimestep(0);
+  await setTimestep(0);
   updateUI();
   applySceneDisplayMode();
   if (showCrossSection2D) applyCrossSectionCamera();
@@ -2845,35 +2898,68 @@ function loadFromFile(file) {
 }
 
 /**
- * Fetch and parse every chunk listed in a chunked result's
- * arc_visualization.iteration_chunks manifest (in parallel; each chunk is
- * independently well under the ~512MB single-string ceiling that made the
- * unchunked file unloadable in the first place), then splice the
- * reassembled iterations array back into `data` in place. After this,
- * `data` looks exactly like an unchunked result already does today, so
- * loadResult()/buildArcTimeline() need no changes at all -- see
- * comotion-vadim/requirements/viewer_result_chunking.md.
+ * Fetch one chunk file and splice its iterations into
+ * resultData.arc_visualization.iterations at the right offset. Chunk data
+ * comes only from our own post-processing script's output (never hand-
+ * edited or from an untrusted source), so — unlike parseResult()'s
+ * normalizeArcVisualization() for inline/untrusted data — this trusts each
+ * iteration's shape at face value rather than re-validating it.
  */
-async function loadChunkedArcVisualization(data, baseUrl) {
-  const manifest = data.arc_visualization.iteration_chunks;
-  if (timestepEl) {
-    timestepEl.textContent = `Loading ${manifest.length} chunk(s)...`;
+async function fetchChunk(chunkIndex) {
+  const entry = chunkState.manifest[chunkIndex];
+  const url = resolveChunkUrl(chunkState.baseUrl, entry.file);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching chunk ${entry.file}`);
+  const body = await res.json();
+  const iterations = body?.iterations || [];
+  for (let i = 0; i < iterations.length; i++) {
+    resultData.arc_visualization.iterations[entry.iteration_start + i] = iterations[i];
   }
-  const chunkBodies = await Promise.all(
-    manifest.map(async (entry) => {
-      const chunkUrl = resolveChunkUrl(baseUrl, entry.file);
-      const res = await fetch(chunkUrl);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} fetching chunk ${entry.file}`);
-      }
-      return res.json();
-    })
-  );
-  data.arc_visualization.iterations = mergeChunkedIterations(chunkBodies);
-  // parseResult() skipped validation/defaulting for this arc_visualization
-  // (schema.js's normalizeArcVisualization) since there was no inline
-  // "iterations" to validate yet -- run it now that there is.
-  normalizeArcVisualization(data);
+  chunkState.loadedChunkIndices.add(chunkIndex);
+}
+
+/** Drop a loaded chunk's iterations back to holes, freeing the memory —
+ * called only for chunks that have fallen outside the current window. */
+function evictChunk(chunkIndex) {
+  const entry = chunkState.manifest[chunkIndex];
+  for (let i = entry.iteration_start; i <= entry.iteration_end; i++) {
+    delete resultData.arc_visualization.iterations[i];
+  }
+  chunkState.loadedChunkIndices.delete(chunkIndex);
+}
+
+/**
+ * Ensure the chunk covering `iterationIndex` is loaded (awaiting it if
+ * not — this is the only blocking part), opportunistically kick off
+ * fetches for its immediate neighbors so normal forward/backward playback
+ * rarely has to wait once it crosses a chunk boundary, and evict any
+ * previously-loaded chunk that has fallen outside this 3-chunk window.
+ * No-op entirely for unchunked results (chunkState is null).
+ */
+async function ensureIterationLoaded(iterationIndex) {
+  if (!chunkState) return;
+  const { manifest, loadedChunkIndices, inFlight } = chunkState;
+  const centerIndex = chunkIndexForIteration(manifest, iterationIndex);
+  if (centerIndex === -1) return;
+  const chunkWindow = chunksInWindow(manifest, centerIndex);
+
+  for (const loadedIndex of [...loadedChunkIndices]) {
+    if (!chunkWindow.includes(loadedIndex)) evictChunk(loadedIndex);
+  }
+
+  for (const index of chunkWindow) {
+    if (!loadedChunkIndices.has(index) && !inFlight.has(index)) {
+      inFlight.set(
+        index,
+        fetchChunk(index).finally(() => inFlight.delete(index))
+      );
+    }
+  }
+
+  if (!loadedChunkIndices.has(centerIndex)) {
+    if (timestepEl) timestepEl.textContent = "Loading chunk...";
+    await inFlight.get(centerIndex);
+  }
 }
 
 /**
@@ -2892,10 +2978,10 @@ async function loadFromUrl(path) {
     }
     const data = parseResult(text);
     if (data) {
-      if (isChunkedArcVisualization(data)) {
-        await loadChunkedArcVisualization(data, url);
-      }
-      await loadResult(data);
+      // For a chunked result, `url` lets loadResult() resolve sibling
+      // chunk filenames -- chunk fetching itself happens on demand inside
+      // setTimestep()/ensureIterationLoaded(), not here.
+      await loadResult(data, url);
     } else {
       if (timestepEl) timestepEl.textContent = "Timestep 0 / 0";
       alert("Invalid or unsupported JSON format.");
