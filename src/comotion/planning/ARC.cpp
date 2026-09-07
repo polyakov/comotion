@@ -430,6 +430,7 @@ void ARC::resetArcSolveState() {
     conflict_resolution_times_seconds_.clear();
     conflict_resolution_times_cpu_seconds_.clear();
     visualization_trace_.clear();
+    captured_subproblem_records_.clear();
 }
 
 void ARC::startVisualizationIteration(const std::vector<Path> &paths) {
@@ -843,6 +844,524 @@ void ARC::finishInitialIndividualPaths(std::vector<Path> &working_paths) {
     setSolutionMetrics(sum_of_cost_timesteps, makespan_timesteps);
 }
 
+ARC::SubproblemHorizonAndRawWindow ARC::subproblemHorizonAndRawWindow(
+    const SubproblemConflict &conflict,
+    const std::vector<Path> &working_paths) const {
+    SubproblemHorizonAndRawWindow result;
+    // max_t = max path length over involved robots (match mr-vamp)
+    std::size_t max_t = 0;
+    for (int r : conflict.robots) {
+        const auto &path = working_paths[static_cast<std::size_t>(r)];
+        const std::size_t path_horizon =
+            path.empty() ? 0 : path.arrival_timestep() + 1;
+        max_t = std::max(max_t, path_horizon);
+    }
+    result.max_t = max_t;
+    if (max_t == 0)
+        return result;
+
+    int start_t = std::max(0, conflict.window_begin_t);
+    int end_t = std::max(conflict.conflict_timestep, conflict.window_end_t);
+    end_t = static_cast<int>(std::min(static_cast<size_t>(std::max(0, end_t)),
+                                      max_t));
+    if (end_t == 0 && max_t > 0)
+        end_t = 1;
+    result.raw_begin_t = start_t;
+    result.raw_end_t = end_t;
+    return result;
+}
+
+std::shared_ptr<MultiRobotProblem> ARC::buildSubproblemForWindow(
+    const std::vector<int> &involved_robots,
+    const std::vector<Path> &working_paths, int start_t, int end_t) const {
+    auto sub_problem = std::make_shared<MultiRobotProblem>(
+        problem_->collisionChecker().backend());
+    sub_problem->setObstacles(
+        std::vector<ObstacleSphere>(
+            problem_->collisionChecker().obstacles().begin(),
+            problem_->collisionChecker().obstacles().end()));
+    sub_problem->setCylinderObstacles(
+        std::vector<ObstacleCylinder>(
+            problem_->collisionChecker().cylinders().begin(),
+            problem_->collisionChecker().cylinders().end()));
+    sub_problem->setVmax(problem_->vmax());
+    sub_problem->setResolution(problem_->resolution());
+
+    for (int r : involved_robots) {
+        auto &robot = problem_->robot(r);
+        const auto &path = working_paths[static_cast<std::size_t>(r)];
+        auto start_config =
+            path.config_at_timestep(static_cast<std::size_t>(start_t));
+        auto goal_config =
+            path.config_at_timestep(static_cast<std::size_t>(end_t));
+        sub_problem->addRobot(robot.model, start_config, goal_config);
+    }
+    return sub_problem;
+}
+
+std::vector<std::optional<ARC::SubproblemRecordCspaceBounds>>
+ARC::computeSubproblemCspaceBounds(const std::vector<int> &involved_robots,
+                                   const std::vector<Path> &working_paths,
+                                   int start_t, int end_t,
+                                   bool temporal_full_window) const {
+    std::vector<std::optional<SubproblemRecordCspaceBounds>> result(
+        involved_robots.size());
+    if (temporal_full_window)
+        return result;
+
+    std::size_t li = 0;
+    for (int r : involved_robots) {
+        auto &robot = problem_->robot(r);
+        const auto &path = working_paths[static_cast<std::size_t>(r)];
+        if (path.empty()) {
+            ++li;
+            continue;
+        }
+        int ndof = robot.model->numJoints();
+        std::vector<double> lo(ndof, std::numeric_limits<double>::max());
+        std::vector<double> hi(ndof, std::numeric_limits<double>::lowest());
+        auto include_config = [&](const std::vector<double> &config) {
+            for (int d = 0; d < ndof; ++d) {
+                double v = config[static_cast<size_t>(d)];
+                lo[d] = std::min(lo[d], v);
+                hi[d] = std::max(hi[d], v);
+            }
+        };
+        std::vector<double> sampled_config;
+        path.config_at_timestep(static_cast<std::size_t>(start_t),
+                                sampled_config);
+        include_config(sampled_config);
+        path.config_at_timestep(static_cast<std::size_t>(end_t),
+                                sampled_config);
+        include_config(sampled_config);
+        if (path.has_explicit_timesteps()) {
+            for (size_t waypoint = 0; waypoint < path.size(); ++waypoint) {
+                const size_t waypoint_t = path.timestep_at(waypoint);
+                if (waypoint_t < static_cast<size_t>(start_t) ||
+                    waypoint_t > static_cast<size_t>(end_t)) {
+                    continue;
+                }
+                include_config(path[waypoint]);
+            }
+        } else {
+            const size_t seg_start =
+                std::min(static_cast<size_t>(start_t), path.size() - 1);
+            const size_t seg_end =
+                std::min(static_cast<size_t>(end_t), path.size() - 1);
+            for (size_t t = seg_start; t <= seg_end && t < path.size(); ++t) {
+                include_config(path[t]);
+            }
+        }
+        double margin = static_cast<double>(cspace_bound_margin_);
+        const double min_span = min_cspace_bound_range_;
+        for (int d = 0; d < ndof; ++d) {
+            double range_d = hi[d] - lo[d];
+            double expansion = margin * range_d;
+            double jlo = robot.model->jointLower(d);
+            double jhi = robot.model->jointUpper(d);
+            double pre_lo = lo[d] - expansion;
+            double pre_hi = hi[d] + expansion;
+            lo[d] = std::max(pre_lo, jlo);
+            hi[d] = std::min(pre_hi, jhi);
+            if (lo[d] > hi[d])
+                lo[d] = hi[d] = 0.5 * (lo[d] + hi[d]);
+
+            if (min_span > 0.0 && hi[d] - lo[d] < min_span) {
+                const double mid = 0.5 * (lo[d] + hi[d]);
+                const double half = 0.5 * min_span;
+                const double joint_span = jhi - jlo;
+                if (joint_span >= min_span) {
+                    const double m = std::clamp(mid, jlo + half, jhi - half);
+                    lo[d] = m - half;
+                    hi[d] = m + half;
+                } else {
+                    lo[d] = jlo;
+                    hi[d] = jhi;
+                }
+            }
+        }
+        SubproblemRecordCspaceBounds bounds;
+        bounds.lo = std::move(lo);
+        bounds.hi = std::move(hi);
+        result[li] = std::move(bounds);
+        ++li;
+    }
+    return result;
+}
+
+ARC::SubproblemEndpointValidity ARC::checkSubproblemEndpointValidity(
+    const MultiRobotProblem &sub_problem) const {
+    auto sub_ptrs = sub_problem.robotModelPtrs();
+    std::vector<std::vector<double>> joint_start, joint_goal;
+    joint_start.reserve(sub_ptrs.size());
+    joint_goal.reserve(sub_ptrs.size());
+    for (int si = 0; si < sub_problem.numRobots(); ++si) {
+        joint_start.push_back(sub_problem.robot(si).start);
+        joint_goal.push_back(sub_problem.robot(si).goal);
+    }
+    const auto &cc_sub = sub_problem.collisionChecker();
+    SubproblemEndpointValidity validity;
+    validity.start_valid =
+        sub_ptrs.empty() || cc_sub.isValidComposite(sub_ptrs, joint_start);
+    validity.goal_valid =
+        sub_ptrs.empty() || cc_sub.isValidComposite(sub_ptrs, joint_goal);
+    return validity;
+}
+
+ARC::ValidWindowSearchResult ARC::findValidWindow(
+    const std::vector<int> &involved_robots,
+    const std::vector<Path> &working_paths, int raw_begin_t, int raw_end_t,
+    std::size_t max_t) const {
+    ValidWindowSearchResult result;
+    if (max_t == 0)
+        return result;
+
+    // Fresh, local schedule state: this search never establishes main-phase
+    // geometry (it always returns as soon as endpoints are valid, before
+    // any call that could flip initial_valid_window_established), so every
+    // step below stays on the InitialValid expansion schedule -- exactly
+    // mirroring the prefix of solveSubproblemOnPaths's own loop that runs
+    // before its first solver invocation.
+    ExpansionScheduleState state;
+    int start_t = raw_begin_t;
+    int end_t = raw_end_t;
+    for (;;) {
+        auto sub_problem =
+            buildSubproblemForWindow(involved_robots, working_paths, start_t,
+                                     end_t);
+        const auto validity = checkSubproblemEndpointValidity(*sub_problem);
+        result.trace.push_back({start_t, end_t, validity.start_valid,
+                                validity.goal_valid,
+                                validity.start_valid && validity.goal_valid});
+        if (validity.start_valid && validity.goal_valid) {
+            result.found = true;
+            result.begin_t = start_t;
+            result.end_t = end_t;
+            result.start_valid = validity.start_valid;
+            result.goal_valid = validity.goal_valid;
+            return result;
+        }
+        if (start_t == 0 && static_cast<std::size_t>(std::max(0, end_t)) >=
+                                max_t) {
+            result.found = false;
+            return result;
+        }
+        const int prev_start = start_t;
+        const std::size_t prev_end = static_cast<std::size_t>(end_t);
+        const std::size_t initial_valid_index_before =
+            state.initial_valid_expansion_index;
+        std::tie(start_t, end_t) = nextExpansionWindowAfterAttempt(
+            start_t, end_t, max_t, validity.start_valid, validity.goal_valid,
+            state);
+        const bool repeated_custom_window =
+            state.last_expansion_used_initial_valid_schedule &&
+            initialValidWindowExpansionPolicy() ==
+                ExpansionPolicy::CustomMultiplied &&
+            initial_valid_index_before <
+                initialValidWindowExpansionMultipliers().size();
+        if (start_t == prev_start &&
+            static_cast<std::size_t>(end_t) == prev_end &&
+            !repeated_custom_window) {
+            result.found = false;
+            return result;
+        }
+    }
+}
+
+void ARC::captureSubproblemRecord(const SubproblemConflict &conflict,
+                                  const std::vector<Path> &working_paths) {
+    if (!capture_subproblem_records_)
+        return;
+
+    CapturedSubproblemRecord record;
+    record.conflict_sequence_index = num_conflicts_;
+    // next_repair_attempt_id_ has not been incremented for this conflict
+    // yet -- resolveConflictOnPaths/solveSubproblemOnPaths runs immediately
+    // after this call and will assign exactly this value.
+    record.repair_id = next_repair_attempt_id_;
+    record.seed_robot_i = conflict.seed_robot_i;
+    record.seed_robot_j = conflict.seed_robot_j;
+    record.conflict_timestep = conflict.conflict_timestep;
+    record.kind = conflict.kind;
+    record.alpha = conflict.alpha;
+    record.config_i = conflict.config_i;
+    record.config_j = conflict.config_j;
+    record.robot_selection_trace = conflict.expansion_trace;
+
+    const auto horizon =
+        subproblemHorizonAndRawWindow(conflict, working_paths);
+    record.max_t = horizon.max_t;
+    record.raw_window.begin_t = horizon.raw_begin_t;
+    record.raw_window.end_t = horizon.raw_end_t;
+
+    if (horizon.max_t == 0) {
+        // Degenerate (no path data for the involved robots): emit a
+        // negative record rather than silently dropping this conflict.
+        captured_subproblem_records_.push_back(std::move(record));
+        return;
+    }
+
+    {
+        auto raw_sub_problem = buildSubproblemForWindow(
+            conflict.robots, working_paths, horizon.raw_begin_t,
+            horizon.raw_end_t);
+        const auto raw_validity =
+            checkSubproblemEndpointValidity(*raw_sub_problem);
+        record.raw_window.start_valid = raw_validity.start_valid;
+        record.raw_window.goal_valid = raw_validity.goal_valid;
+        record.raw_window.endpoints_valid =
+            raw_validity.start_valid && raw_validity.goal_valid;
+    }
+
+    const auto search =
+        findValidWindow(conflict.robots, working_paths, horizon.raw_begin_t,
+                        horizon.raw_end_t, horizon.max_t);
+    record.validity_search_expansion_count =
+        search.trace.empty() ? 0 : search.trace.size() - 1;
+    record.validity_search_trace = search.trace;
+    record.valid_window_found = search.found;
+    if (search.found) {
+        record.valid_window.begin_t = search.begin_t;
+        record.valid_window.end_t = search.end_t;
+        record.valid_window.start_valid = search.start_valid;
+        record.valid_window.goal_valid = search.goal_valid;
+        record.valid_window.endpoints_valid = true;
+    }
+
+    std::vector<std::optional<SubproblemRecordCspaceBounds>> cspace_bounds;
+    if (search.found) {
+        const bool temporal_full_window_at_valid = isTemporalFullWindow(
+            search.begin_t, search.end_t, horizon.max_t);
+        cspace_bounds = computeSubproblemCspaceBounds(
+            conflict.robots, working_paths, search.begin_t, search.end_t,
+            temporal_full_window_at_valid);
+    }
+
+    record.robots.reserve(conflict.robots.size());
+    std::size_t li = 0;
+    for (int r : conflict.robots) {
+        auto &robot_instance = problem_->robot(r);
+        SubproblemRecordRobotEntry entry;
+        entry.global_robot_index = r;
+
+        // v1 scope assumption (subproblem-record-design.md): every robot in
+        // mobile_robot_2d_crossing is a 3-DOF comotion::FlyingSphere (one
+        // collision sphere, joints 0..2 = x/y/z workspace bounds). If a
+        // future scenario/app feeds ARC a different robot model with
+        // capture enabled, fail loudly here rather than silently emitting a
+        // wrong-shaped record -- extend this block (and the schema) before
+        // reusing capture for non-FlyingSphere robots.
+        if (robot_instance.model->numJoints() != 3) {
+            throw std::runtime_error(
+                "ARC subproblem record capture supports only 3-DOF "
+                "FlyingSphere robots (subproblem-record-design.md); robot " +
+                std::to_string(r) + " has " +
+                std::to_string(robot_instance.model->numJoints()) +
+                " joints");
+        }
+        const auto spheres = robot_instance.model->getCollisionSpheres(
+            std::vector<double>(3, 0.0));
+        if (spheres.size() != 1) {
+            throw std::runtime_error(
+                "ARC subproblem record capture supports only single-sphere "
+                "FlyingSphere robots; robot " +
+                std::to_string(r) + " has " +
+                std::to_string(spheres.size()) + " collision spheres");
+        }
+        entry.model_radius = spheres.front().radius;
+        entry.model_workspace_min = {robot_instance.model->jointLower(0),
+                                     robot_instance.model->jointLower(1),
+                                     robot_instance.model->jointLower(2)};
+        entry.model_workspace_max = {robot_instance.model->jointUpper(0),
+                                     robot_instance.model->jointUpper(1),
+                                     robot_instance.model->jointUpper(2)};
+
+        const auto &path = working_paths[static_cast<std::size_t>(r)];
+        entry.start_config_raw = path.config_at_timestep(
+            static_cast<std::size_t>(horizon.raw_begin_t));
+        entry.goal_config_raw = path.config_at_timestep(
+            static_cast<std::size_t>(horizon.raw_end_t));
+        if (search.found) {
+            entry.start_config_valid = path.config_at_timestep(
+                static_cast<std::size_t>(search.begin_t));
+            entry.goal_config_valid = path.config_at_timestep(
+                static_cast<std::size_t>(search.end_t));
+            if (li < cspace_bounds.size() && cspace_bounds[li])
+                entry.cspace_bounds = cspace_bounds[li];
+        }
+        record.robots.push_back(std::move(entry));
+        ++li;
+    }
+
+    captured_subproblem_records_.push_back(std::move(record));
+}
+
+namespace {
+
+const char *conflictKindStr(ConflictKind kind) {
+    switch (kind) {
+    case ConflictKind::Vertex:
+        return "Vertex";
+    }
+    return "Vertex";
+}
+
+const char *subproblemRecordCollisionBackendStr(
+    CollisionChecker::Backend backend) {
+    switch (backend) {
+    case CollisionChecker::Backend::Spheres:
+        return "Spheres";
+    case CollisionChecker::Backend::Fcl:
+        return "Fcl";
+    case CollisionChecker::Backend::Vamp:
+        return "Vamp";
+    }
+    return "Spheres";
+}
+
+nlohmann::json subproblemRecordWindowJson(
+    const ARC::SubproblemRecordWindowState &window, bool include_endpoints) {
+    nlohmann::json out = {
+        {"begin_t", window.begin_t},
+        {"end_t", window.end_t},
+        {"start_valid", window.start_valid},
+        {"goal_valid", window.goal_valid},
+    };
+    if (include_endpoints)
+        out["endpoints_valid"] = window.endpoints_valid;
+    return out;
+}
+
+} // namespace
+
+nlohmann::json ARC::subproblemRecordsJson(
+    int schema_version, const nlohmann::json &provenance_source,
+    const nlohmann::json &provenance_run_args,
+    const std::string &git_commit) const {
+    nlohmann::json obstacles_spheres = nlohmann::json::array();
+    for (const auto &sphere : problem_->collisionChecker().obstacles()) {
+        obstacles_spheres.push_back({
+            {"center", {sphere.center.x(), sphere.center.y(),
+                       sphere.center.z()}},
+            {"radius", sphere.radius},
+        });
+    }
+    nlohmann::json obstacles_cylinders = nlohmann::json::array();
+    for (const auto &cylinder : problem_->collisionChecker().cylinders()) {
+        obstacles_cylinders.push_back({
+            {"center", {cylinder.center.x(), cylinder.center.y(),
+                       cylinder.center.z()}},
+            {"axis", {cylinder.axis.x(), cylinder.axis.y(),
+                     cylinder.axis.z()}},
+            {"radius", cylinder.radius},
+            {"half_height", cylinder.half_height},
+        });
+    }
+    const nlohmann::json environment = {
+        {"obstacles_spheres", obstacles_spheres},
+        {"obstacles_cylinders", obstacles_cylinders},
+        {"vmax", problem_->vmax()},
+        {"resolution", problem_->resolution()},
+        {"collision_backend", subproblemRecordCollisionBackendStr(
+                                  problem_->collisionChecker().backend())},
+    };
+
+    nlohmann::json records = nlohmann::json::array();
+    for (const auto &record : captured_subproblem_records_) {
+        nlohmann::json robots = nlohmann::json::array();
+        for (const auto &robot : record.robots) {
+            nlohmann::json robot_json = {
+                {"global_robot_index", robot.global_robot_index},
+                {"model",
+                 {
+                     {"radius", robot.model_radius},
+                     {"workspace_min", robot.model_workspace_min},
+                     {"workspace_max", robot.model_workspace_max},
+                 }},
+                {"cspace_bounds",
+                 robot.cspace_bounds
+                     ? nlohmann::json{{"lo", robot.cspace_bounds->lo},
+                                     {"hi", robot.cspace_bounds->hi}}
+                     : nlohmann::json(nullptr)},
+                {"start_config_raw", robot.start_config_raw},
+                {"goal_config_raw", robot.goal_config_raw},
+                {"start_config_valid",
+                 robot.start_config_valid ? nlohmann::json(*robot.start_config_valid)
+                                          : nlohmann::json(nullptr)},
+                {"goal_config_valid",
+                 robot.goal_config_valid ? nlohmann::json(*robot.goal_config_valid)
+                                         : nlohmann::json(nullptr)},
+            };
+            robots.push_back(std::move(robot_json));
+        }
+
+        nlohmann::json robot_selection_trace = nlohmann::json::array();
+        for (const auto &step : record.robot_selection_trace) {
+            robot_selection_trace.push_back({
+                {"from_robot", step.from_robot},
+                {"added_robot", step.added_robot},
+                {"window_robot_a", step.window_robot_a},
+                {"window_robot_b", step.window_robot_b},
+                {"window_start_t", step.window_start_t},
+                {"window_end_t", step.window_end_t},
+                {"history_event_ids", step.history_event_ids},
+            });
+        }
+
+        nlohmann::json validity_search_trace = nlohmann::json::array();
+        for (const auto &step : record.validity_search_trace)
+            validity_search_trace.push_back(
+                subproblemRecordWindowJson(step, false));
+
+        nlohmann::json out = {
+            {"schema_version", schema_version},
+            {"provenance",
+             {
+                 {"source", provenance_source},
+                 {"run_args", provenance_run_args},
+                 {"git_commit", git_commit},
+                 {"conflict_sequence_index", record.conflict_sequence_index},
+                 {"repair_id", record.repair_id},
+             }},
+            {"environment", environment},
+            {"robots", robots},
+            {"seed_conflict",
+             {
+                 {"seed_robot_i", record.seed_robot_i},
+                 {"seed_robot_j", record.seed_robot_j},
+                 {"conflict_timestep", record.conflict_timestep},
+                 {"kind", conflictKindStr(record.kind)},
+                 {"alpha", record.alpha},
+                 {"config_i", record.config_i},
+                 {"config_j", record.config_j},
+                 {"robot_selection_trace", robot_selection_trace},
+             }},
+            {"windows",
+             {
+                 {"max_t", record.max_t},
+                 {"raw_window", subproblemRecordWindowJson(record.raw_window,
+                                                           true)},
+                 {"valid_window",
+                  record.valid_window_found
+                      ? subproblemRecordWindowJson(record.valid_window, true)
+                      : nlohmann::json{
+                            {"found", false},
+                        }},
+                 {"validity_search",
+                  {
+                      {"expansion_count",
+                       record.validity_search_expansion_count},
+                      {"trace", validity_search_trace},
+                      {"cost", nullptr},
+                  }},
+             }},
+        };
+        out["windows"]["valid_window"]["found"] = record.valid_window_found;
+        records.push_back(std::move(out));
+    }
+    return records;
+}
+
 bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
                                  const Clock::time_point &solve_start,
                                  double global_time_limit,
@@ -857,23 +1376,13 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
         return cancel_requested && cancel_requested();
     };
 
-    // max_t = max path length over involved robots (match mr-vamp)
-    size_t max_t = 0;
-    for (int r : involved_robots) {
-        const auto &path = working_paths[static_cast<std::size_t>(r)];
-        const std::size_t path_horizon =
-            path.empty() ? 0 : path.arrival_timestep() + 1;
-        max_t = std::max(max_t, path_horizon);
-    }
+    const auto horizon = subproblemHorizonAndRawWindow(conflict, working_paths);
+    const std::size_t max_t = horizon.max_t;
     if (max_t == 0)
         return false;
 
-    int start_t = std::max(0, conflict.window_begin_t);
-    int end_t = std::max(conflict.conflict_timestep, conflict.window_end_t);
-    end_t = static_cast<int>(std::min(static_cast<size_t>(std::max(0, end_t)),
-                                      max_t));
-    if (end_t == 0 && max_t > 0)
-        end_t = 1;
+    int start_t = horizon.raw_begin_t;
+    int end_t = horizon.raw_end_t;
     ExpansionScheduleState expansion_schedule_state;
     const std::uint64_t repair_id = next_repair_attempt_id_++;
     std::uint64_t repair_attempt_index = 0;
@@ -926,44 +1435,13 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
         }
 
         // Build local subproblem
-        auto sub_problem = std::make_shared<MultiRobotProblem>(
-            problem_->collisionChecker().backend());
-        sub_problem->setObstacles(
-            std::vector<ObstacleSphere>(
-                problem_->collisionChecker().obstacles().begin(),
-                problem_->collisionChecker().obstacles().end()));
-        sub_problem->setCylinderObstacles(
-            std::vector<ObstacleCylinder>(
-                problem_->collisionChecker().cylinders().begin(),
-                problem_->collisionChecker().cylinders().end()));
-        sub_problem->setVmax(problem_->vmax());
-        sub_problem->setResolution(problem_->resolution());
-
-        for (int r : involved_robots) {
-            auto &robot = problem_->robot(r);
-            const auto &path = working_paths[static_cast<std::size_t>(r)];
-            auto start_config =
-                path.config_at_timestep(static_cast<std::size_t>(start_t));
-            auto goal_config =
-                path.config_at_timestep(static_cast<std::size_t>(end_t));
-            sub_problem->addRobot(robot.model, start_config, goal_config);
-        }
-
-        auto sub_ptrs = sub_problem->robotModelPtrs();
-        std::vector<std::vector<double>> joint_start, joint_goal;
-        joint_start.reserve(sub_ptrs.size());
-        joint_goal.reserve(sub_ptrs.size());
-        for (int si = 0; si < sub_problem->numRobots(); ++si) {
-            joint_start.push_back(sub_problem->robot(si).start);
-            joint_goal.push_back(sub_problem->robot(si).goal);
-        }
-        auto &cc_sub = sub_problem->collisionChecker();
-        const bool start_composite_ok =
-            sub_ptrs.empty() ||
-            cc_sub.isValidComposite(sub_ptrs, joint_start);
-        const bool goal_composite_ok =
-            sub_ptrs.empty() ||
-            cc_sub.isValidComposite(sub_ptrs, joint_goal);
+        auto sub_problem =
+            buildSubproblemForWindow(involved_robots, working_paths, start_t,
+                                     end_t);
+        const auto endpoint_validity =
+            checkSubproblemEndpointValidity(*sub_problem);
+        const bool start_composite_ok = endpoint_validity.start_valid;
+        const bool goal_composite_ok = endpoint_validity.goal_valid;
         const bool local_endpoints_valid =
             start_composite_ok && goal_composite_ok;
         current_event.validity_checked = true;
@@ -983,91 +1461,19 @@ bool ARC::solveSubproblemOnPaths(const SubproblemConflict &conflict,
         }
 
         const bool temporal_full_window =
-            (start_t == 0 && max_t > 0 &&
-             static_cast<size_t>(end_t) >= max_t - 1);
+            isTemporalFullWindow(start_t, end_t, max_t);
         current_event.temporal_full_window = temporal_full_window;
 
         if (use_cspace_bounds_) {
-            size_t li = 0;
-            for (int r : involved_robots) {
-                auto &robot = problem_->robot(r);
-                const auto &path = working_paths[static_cast<std::size_t>(r)];
-                if (path.empty()) {
-                    ++li;
-                    continue;
+            const auto cspace_bounds = computeSubproblemCspaceBounds(
+                involved_robots, working_paths, start_t, end_t,
+                temporal_full_window);
+            for (std::size_t li = 0; li < cspace_bounds.size(); ++li) {
+                if (cspace_bounds[li]) {
+                    sub_problem->setCspaceBoundsForRobot(
+                        static_cast<int>(li), cspace_bounds[li]->lo,
+                        cspace_bounds[li]->hi);
                 }
-                int ndof = robot.model->numJoints();
-                if (temporal_full_window) {
-                    ++li;
-                    continue;
-                }
-                std::vector<double> lo(ndof, std::numeric_limits<double>::max());
-                std::vector<double> hi(ndof, std::numeric_limits<double>::lowest());
-                auto include_config = [&](const std::vector<double> &config) {
-                    for (int d = 0; d < ndof; ++d) {
-                        double v = config[static_cast<size_t>(d)];
-                        lo[d] = std::min(lo[d], v);
-                        hi[d] = std::max(hi[d], v);
-                    }
-                };
-                std::vector<double> sampled_config;
-                path.config_at_timestep(static_cast<std::size_t>(start_t),
-                                        sampled_config);
-                include_config(sampled_config);
-                path.config_at_timestep(static_cast<std::size_t>(end_t),
-                                        sampled_config);
-                include_config(sampled_config);
-                if (path.has_explicit_timesteps()) {
-                    for (size_t waypoint = 0; waypoint < path.size();
-                         ++waypoint) {
-                        const size_t waypoint_t = path.timestep_at(waypoint);
-                        if (waypoint_t < static_cast<size_t>(start_t) ||
-                            waypoint_t > static_cast<size_t>(end_t)) {
-                            continue;
-                        }
-                        include_config(path[waypoint]);
-                    }
-                } else {
-                    const size_t seg_start =
-                        std::min(static_cast<size_t>(start_t), path.size() - 1);
-                    const size_t seg_end =
-                        std::min(static_cast<size_t>(end_t), path.size() - 1);
-                    for (size_t t = seg_start; t <= seg_end && t < path.size();
-                         ++t) {
-                        include_config(path[t]);
-                    }
-                }
-                double margin = static_cast<double>(cspace_bound_margin_);
-                const double min_span = min_cspace_bound_range_;
-                for (int d = 0; d < ndof; ++d) {
-                    double range_d = hi[d] - lo[d];
-                    double expansion = margin * range_d;
-                    double jlo = robot.model->jointLower(d);
-                    double jhi = robot.model->jointUpper(d);
-                    double pre_lo = lo[d] - expansion;
-                    double pre_hi = hi[d] + expansion;
-                    lo[d] = std::max(pre_lo, jlo);
-                    hi[d] = std::min(pre_hi, jhi);
-                    if (lo[d] > hi[d])
-                        lo[d] = hi[d] = 0.5 * (lo[d] + hi[d]);
-
-                    if (min_span > 0.0 && hi[d] - lo[d] < min_span) {
-                        const double mid = 0.5 * (lo[d] + hi[d]);
-                        const double half = 0.5 * min_span;
-                        const double joint_span = jhi - jlo;
-                        if (joint_span >= min_span) {
-                            const double m =
-                                std::clamp(mid, jlo + half, jhi - half);
-                            lo[d] = m - half;
-                            hi[d] = m + half;
-                        } else {
-                            lo[d] = jlo;
-                            hi[d] = jhi;
-                        }
-                    }
-                }
-                sub_problem->setCspaceBoundsForRobot(static_cast<int>(li), lo, hi);
-                ++li;
             }
         }
         std::optional<std::uint64_t> local_makespan_bound_timesteps;
@@ -2311,6 +2717,14 @@ ompl::base::PlannerStatus ARC::solve(double timeLimit) {
         ++num_conflicts_;
 
         const auto subproblem_conflict = conflicts.front();
+
+        // Capture the raw, unrepaired conflict (SubproblemRecord data
+        // collection) before any repair attempt touches it. Uses
+        // solution_paths_ exactly as they stand right now -- which may
+        // already reflect earlier, unrelated repairs made earlier in this
+        // same solve() call; only this specific conflict is guaranteed
+        // unrepaired.
+        captureSubproblemRecord(subproblem_conflict, solution_paths_);
 
         const auto conflict_resolution_start = Clock::now();
         const double conflict_resolution_cpu_start = processCpuSeconds();

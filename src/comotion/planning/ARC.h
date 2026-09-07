@@ -53,6 +53,66 @@ public:
         std::vector<VisualizationRepair> repairs;
     };
 
+    // --- SubproblemRecord capture (data-collection/subproblem-record-design.md) ---
+    // Mirrors the schema's `windows.raw_window` / `windows.valid_window`: a
+    // temporal window plus whether its composite start/goal configs are
+    // collision-free.
+    struct SubproblemRecordWindowState {
+        int begin_t = 0;
+        int end_t = 0;
+        bool start_valid = false;
+        bool goal_valid = false;
+        bool endpoints_valid = false;
+    };
+
+    struct SubproblemRecordCspaceBounds {
+        std::vector<double> lo;
+        std::vector<double> hi;
+    };
+
+    // Mirrors the schema's `RobotEntry`.
+    struct SubproblemRecordRobotEntry {
+        int global_robot_index = -1;
+        double model_radius = 0.0;
+        std::vector<double> model_workspace_min;
+        std::vector<double> model_workspace_max;
+        // null when temporal_full_window or !use_cspace_bounds_, matching
+        // ARC.cpp's own skip conditions for cspace-bound computation.
+        std::optional<SubproblemRecordCspaceBounds> cspace_bounds;
+        std::vector<double> start_config_raw;
+        std::vector<double> goal_config_raw;
+        // null when the valid-window search never found a valid window.
+        std::optional<std::vector<double>> start_config_valid;
+        std::optional<std::vector<double>> goal_config_valid;
+    };
+
+    // One captured raw, unrepaired conflict -- everything needed to render
+    // the schema's SubproblemRecord except the run-level `provenance` block
+    // (schema_version/source/run_args/git_commit), which the caller (the
+    // application, not ARC) supplies via subproblemRecordsJson() below.
+    struct CapturedSubproblemRecord {
+        std::uint64_t conflict_sequence_index = 0;
+        std::uint64_t repair_id = 0;
+        int seed_robot_i = -1;
+        int seed_robot_j = -1;
+        int conflict_timestep = 0;
+        ConflictKind kind = ConflictKind::Vertex;
+        double alpha = 0.0;
+        std::vector<double> config_i;
+        std::vector<double> config_j;
+        std::vector<SubproblemConflict::ExpansionTraceStep>
+            robot_selection_trace;
+        std::size_t max_t = 0;
+        SubproblemRecordWindowState raw_window;
+        bool valid_window_found = false;
+        SubproblemRecordWindowState valid_window;
+        std::uint64_t validity_search_expansion_count = 0;
+        std::vector<SubproblemRecordWindowState> validity_search_trace;
+        // Ordered ascending by global_robot_index (== conflict.robots order);
+        // this IS the PrioritizedSTRRT priority order -- do not reorder.
+        std::vector<SubproblemRecordRobotEntry> robots;
+    };
+
     ompl::base::PlannerStatus solve(double timeLimit) override;
     std::vector<Path> getSolutionPaths() const override;
     std::string name() const override { return "ARC"; }
@@ -72,6 +132,36 @@ public:
     const std::vector<VisualizationIteration> &visualizationTrace() const {
         return visualization_trace_;
     }
+
+    /// Capture one SubproblemRecord per raw, unrepaired conflict ARC detects
+    /// during solve(), at the moment each conflict is about to be handed to
+    /// resolveConflictOnPaths -- i.e. before any repair attempt (a1/a3/a4)
+    /// touches it. Disabled by default; applications gate this on their own
+    /// flag (e.g. --conflict-record-dir).
+    void setCaptureSubproblemRecords(bool enabled) {
+        capture_subproblem_records_ = enabled;
+        if (!enabled)
+            captured_subproblem_records_.clear();
+    }
+    bool captureSubproblemRecordsEnabled() const {
+        return capture_subproblem_records_;
+    }
+    const std::vector<CapturedSubproblemRecord> &
+    capturedSubproblemRecords() const {
+        return captured_subproblem_records_;
+    }
+    /// Renders captured records to the SubproblemRecord JSON schema
+    /// (subproblem-record-design.md), one array entry per capture. ARC
+    /// supplies everything it knows (seed conflict, windows, robot
+    /// geometry/configs, environment from the live `problem_`); the caller
+    /// supplies the `provenance` fields ARC has no way to know (CLI args
+    /// used to regenerate the run, git commit). Call before the
+    /// planner/problem is torn down -- environment is read from `problem_`
+    /// live, not cached at capture time.
+    nlohmann::json subproblemRecordsJson(
+        int schema_version, const nlohmann::json &provenance_source,
+        const nlohmann::json &provenance_run_args,
+        const std::string &git_commit) const;
 
     void setInitialWindow(int w) { initial_window_ = std::max(1, w); }
     void setExpansionStep(double e) {
@@ -544,6 +634,99 @@ protected:
     virtual SubproblemConflict
     expandConflictForSubproblem(const Conflict &conflict) const;
 
+    // --- Shared window-search primitives ---
+    // Factored out of solveSubproblemOnPaths so its endpoint-validity-check
+    // and window-expansion-search logic exists in exactly one place: the
+    // real resolution loop below and findValidWindow() (used only by
+    // SubproblemRecord capture, see captureSubproblemRecord()) are both
+    // built from these same pieces plus the pre-existing
+    // nextExpansionWindowAfterAttempt(), so they cannot drift apart.
+
+    struct SubproblemEndpointValidity {
+        bool start_valid = false;
+        bool goal_valid = false;
+    };
+
+    struct SubproblemHorizonAndRawWindow {
+        std::size_t max_t = 0;
+        int raw_begin_t = 0;
+        int raw_end_t = 0;
+    };
+
+    struct ValidWindowSearchResult {
+        // false only if even the full horizon [0, max_t] has invalid
+        // endpoints.
+        bool found = false;
+        int begin_t = 0;
+        int end_t = 0;
+        bool start_valid = false;
+        bool goal_valid = false;
+        // Every window tried, in order, including the raw window (first
+        // entry) and the terminal window (valid or global-and-failed).
+        std::vector<SubproblemRecordWindowState> trace;
+    };
+
+    // max_t (path horizon over involved robots) and the raw temporal
+    // window for a conflict, matching solveSubproblemOnPaths's own
+    // window-arithmetic (ARC.cpp:860-876): max_t = max involved-robot path
+    // length; raw window = conflict.window_begin_t/window_end_t clamped
+    // into [0, max_t].
+    SubproblemHorizonAndRawWindow subproblemHorizonAndRawWindow(
+        const SubproblemConflict &conflict,
+        const std::vector<Path> &working_paths) const;
+
+    // Standalone MultiRobotProblem containing exactly `involved_robots`,
+    // with obstacles/vmax/resolution copied from problem_ and each robot's
+    // start/goal pinned to its existing global-path config at
+    // start_t/end_t (ARC.cpp:928-950). Pure: reads problem_ and
+    // working_paths only, mutates neither.
+    std::shared_ptr<MultiRobotProblem> buildSubproblemForWindow(
+        const std::vector<int> &involved_robots,
+        const std::vector<Path> &working_paths, int start_t,
+        int end_t) const;
+
+    // Composite start/goal collision validity for a subproblem already
+    // built (by buildSubproblemForWindow or equivalently) for the window
+    // it was built against (ARC.cpp:952-972).
+    SubproblemEndpointValidity checkSubproblemEndpointValidity(
+        const MultiRobotProblem &sub_problem) const;
+
+    // Per-robot C-space sampling bounds for a window, indexed the same as
+    // `involved_robots` (ARC.cpp:990-1069's margin/clamp geometry).
+    // nullopt entries mean "no bound" -- matches ARC's own skip conditions
+    // (use_cspace_bounds_ off, robot path empty, or temporal_full_window).
+    std::vector<std::optional<SubproblemRecordCspaceBounds>>
+    computeSubproblemCspaceBounds(const std::vector<int> &involved_robots,
+                                  const std::vector<Path> &working_paths,
+                                  int start_t, int end_t,
+                                  bool temporal_full_window) const;
+
+    static bool isTemporalFullWindow(int start_t, int end_t,
+                                     std::size_t max_t) {
+        return start_t == 0 && max_t > 0 &&
+               static_cast<std::size_t>(end_t) >= max_t - 1;
+    }
+
+    // Independently replays ARC's endpoint-validity-check +
+    // window-expansion search (solveSubproblemOnPaths steps 2 and 5,
+    // InitialValid phase only) to find the first temporal window whose
+    // composite start and goal configs are collision-free -- WITHOUT
+    // invoking any a1/a3 solver and WITHOUT mutating any ARC state
+    // (repair_window_schedule_, solution_paths_, counters, RNG, etc). Uses
+    // a fresh, local ExpansionScheduleState, so it never touches the
+    // schedule state a live solveSubproblemOnPaths call owns.
+    ValidWindowSearchResult
+    findValidWindow(const std::vector<int> &involved_robots,
+                    const std::vector<Path> &working_paths, int raw_begin_t,
+                    int raw_end_t, std::size_t max_t) const;
+
+    // Builds and appends one CapturedSubproblemRecord for `conflict` as
+    // detected against `working_paths` -- the raw, unrepaired conflict,
+    // captured before resolveConflictOnPaths is ever called on it. No-op
+    // unless capture_subproblem_records_ is set.
+    void captureSubproblemRecord(const SubproblemConflict &conflict,
+                                 const std::vector<Path> &working_paths);
+
     // Cascade merge via recursive repair-window closure: start from the
     // conflicting pair and repeatedly union robots with prior pair repair
     // windows that intersect the proposed conflict patch window.
@@ -630,6 +813,8 @@ protected:
     std::vector<double> conflict_resolution_times_cpu_seconds_;
     bool visualization_trace_enabled_ = false;
     std::vector<VisualizationIteration> visualization_trace_;
+    bool capture_subproblem_records_ = false;
+    std::vector<CapturedSubproblemRecord> captured_subproblem_records_;
 };
 
 using ArcLocalSolverMode = ARC::LocalSolverMode;
