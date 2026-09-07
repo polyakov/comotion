@@ -12,8 +12,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -71,6 +73,7 @@ struct AppOptions {
     bool output_endpoint_paths = false;
     std::optional<std::string> metrics_json_path;
     bool exit_nonzero_without_exact_solution = false;
+    std::optional<std::string> conflict_record_dir;
 
     unsigned int strrt_initial_batch_size = 4096;
     double strrt_initial_time_factor = 2.0;
@@ -326,6 +329,72 @@ void writePathArtifacts(const TrialMetrics &metrics,
               2);
 }
 
+// No existing precedent in this codebase for embedding/reading the current
+// git commit (checked CITATION.cff, CMakeLists.txt, benchmark scripts --
+// none stamp a commit hash anywhere). Shells out at run time as the simplest
+// option; requires the process's working directory to be inside the git
+// working tree. Returns "unknown" if git is unavailable or this isn't a git
+// checkout, so callers always get a well-formed string.
+std::string currentGitCommit() {
+    std::array<char, 256> buffer{};
+    std::string result;
+    FILE *pipe = popen("git rev-parse HEAD 2>/dev/null", "r");
+    if (!pipe)
+        return "unknown";
+    while (fgets(buffer.data(), buffer.size(), pipe))
+        result += buffer.data();
+    pclose(pipe);
+    while (!result.empty() &&
+           (result.back() == '\n' || result.back() == '\r'))
+        result.pop_back();
+    return result.empty() ? "unknown" : result;
+}
+
+// Writes one SubproblemRecord JSON file (data-collection/
+// subproblem-record-design.md, schema_version 1) per conflict ARC captured
+// during solve(), named "conflict_<conflict_sequence_index>.json".
+void writeSubproblemRecords(
+    const std::shared_ptr<comotion::ARC> &arc, const AppOptions &options,
+    const crossing::GeneratedScenario &generated,
+    const std::shared_ptr<comotion::MultiRobotProblem> &problem) {
+    const std::filesystem::path dir = *options.conflict_record_dir;
+    std::filesystem::create_directories(dir);
+
+    const json source = {
+        {"app", "mobile_robot_2d_crossing"},
+        {"scenario", generated.scenario_name},
+    };
+    const json run_args = {
+        {"num_robots", generated.num_robots},
+        {"left_x", options.left_x},
+        {"right_x", options.right_x},
+        {"y_min", options.y_min},
+        {"y_max", options.y_max},
+        {"robot_radius", options.robot_radius},
+        {"scenario_generation_seed", options.scenario_generation_seed},
+        {"seed", options.seed},
+        {"resolution", options.resolution},
+        {"vmax", problem->vmax()},
+        {"collision_backend", backendName(options.collision_backend)},
+    };
+    const std::string git_commit = currentGitCommit();
+
+    const auto &captured = arc->capturedSubproblemRecords();
+    const json records_json =
+        arc->subproblemRecordsJson(1, source, run_args, git_commit);
+    for (std::size_t i = 0; i < captured.size(); ++i) {
+        const std::filesystem::path file_path =
+            dir / ("conflict_" +
+                   std::to_string(captured[i].conflict_sequence_index) +
+                   ".json");
+        writeJson(records_json[i], file_path, 2);
+    }
+    if (g_app_verbose || captured.empty()) {
+        std::cout << "Wrote " << captured.size()
+                  << " conflict record(s) to " << dir.string() << "\n";
+    }
+}
+
 TrialMetrics runPlanner(
     const crossing::GeneratedScenario &generated, const AppOptions &options,
     const json &benchmark_context,
@@ -505,6 +574,9 @@ void printUsage(const char *prog) {
         << "  --max-placement-attempts <n> Random_crossing only; rejection-sampling retry cap (default: 10000)\n"
         << "  --resolution <n>         Timesteps per second (default: 128)\n"
         << "  --metrics-json <path>    Write compact trial metrics JSON\n"
+        << "  --conflict-record-dir <dir> Write one SubproblemRecord JSON file per\n"
+        << "                           raw, unrepaired conflict ARC detects (requires\n"
+        << "                           --algorithm arc)\n"
         << "  --output-paths           Write visualization result JSON and .pth files\n"
         << "  --track-arc-history      With --output-paths, embed ARC process history\n"
         << "  --output-roadmaps        With --output-paths, embed each robot's planning\n"
@@ -648,6 +720,8 @@ AppOptions parseArgs(int argc, char **argv) {
                 std::stoul(requireValue(i, argc, argv, arg)));
         } else if (arg == "--metrics-json") {
             options.metrics_json_path = requireValue(i, argc, argv, arg);
+        } else if (arg == "--conflict-record-dir") {
+            options.conflict_record_dir = requireValue(i, argc, argv, arg);
         } else if (arg == "--output-paths") {
             options.output_paths = true;
         } else if (arg == "--track-arc-history") {
@@ -922,6 +996,8 @@ AppOptions parseArgs(int argc, char **argv) {
         throw std::runtime_error("--time-limit must be positive");
     if (options.resolution == 0)
         throw std::runtime_error("--resolution must be at least 1");
+    if (options.conflict_record_dir && options.algorithm != "arc")
+        throw std::runtime_error("--conflict-record-dir requires --algorithm arc");
     common::validateSelectedPlannerOptions(options,
                                            !options.output_endpoint_paths);
     if (options.algorithm == "stcbs") {
@@ -1030,6 +1106,23 @@ int main(int argc, char **argv) {
             stcbs->setOccupiedRadius(options.stcbs_occupied_radius);
         }
 
+        std::shared_ptr<comotion::ARC> conflict_record_arc;
+        if (options.conflict_record_dir) {
+            // parseArgs already enforces --algorithm arc for this flag; the
+            // only remaining way to not get a direct ARC instance here is
+            // --or-parallel-worker-processes wrapping the ARC factory in an
+            // OrParallelPlanner, which owns/discards its own ARC instances
+            // internally and never exposes one for capture.
+            conflict_record_arc = std::dynamic_pointer_cast<comotion::ARC>(planner);
+            if (!conflict_record_arc) {
+                throw std::runtime_error(
+                    "--conflict-record-dir requires a direct ARC planner "
+                    "instance; it is not compatible with "
+                    "--or-parallel-worker-processes > 1");
+            }
+            conflict_record_arc->setCaptureSubproblemRecords(true);
+        }
+
         const TrialMetrics metrics =
             options.parallel_arc_conflict_ablation_only
                 ? runParallelArcConflictAblation(
@@ -1038,6 +1131,12 @@ int main(int argc, char **argv) {
                       planner_name)
                 : runPlanner(generated, options, context, problem, planner,
                              planner_name);
+
+        if (conflict_record_arc) {
+            writeSubproblemRecords(conflict_record_arc, options, generated,
+                                   problem);
+        }
+
         if (options.exit_nonzero_without_exact_solution && !metrics.success)
             return 1;
         return 0;
