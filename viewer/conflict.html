@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conflict Detail</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, sans-serif; color: #222; background: #ffffff;
+      padding: 16px 20px 40px;
+    }
+    #header { margin-bottom: 14px; }
+    #header a { font-size: 13px; color: #2196f3; text-decoration: none; }
+    #header a:hover { text-decoration: underline; }
+    #title {
+      font-size: 15px; font-weight: 600; margin-top: 6px; word-break: break-all;
+      color: #444;
+    }
+    #summary { font-size: 13px; color: #555; margin-top: 4px; }
+    #error { color: #c62828; font-size: 13px; margin-top: 8px; }
+    #json-dump {
+      margin-top: 14px; padding: 12px 14px; background: #f5f5f5;
+      border: 1px solid #e0e0e0; border-radius: 6px;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <a href="index.html">&larr; Back to viewer</a>
+    <div id="title">Loading&hellip;</div>
+    <div id="summary"></div>
+    <div id="error" hidden></div>
+  </div>
+  <pre id="json-dump"></pre>
+  <script type="module" src="js/conflict-detail.js"></script>
+</body>
+</html>

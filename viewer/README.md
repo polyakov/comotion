@@ -149,6 +149,12 @@ t=7377`); clicking it jumps the main timeline to that conflict's
 Navigating this way only moves the timestep — it does not switch playback
 mode or highlight the involved robots.
 
+Each row also has a small ↗ link that opens `conflict.html` in a new tab,
+showing that conflict's full record: a one-line summary plus the raw JSON,
+pretty-printed. It's deliberately a plain JSON dump for now (a starting
+point, not a finished detail view) and is independent of the row's own
+click — opening it doesn't move the main viewer's timestep.
+
 This reads conflict-record JSON files directly from disk via the
 `comotion/vadim` symlink to the sibling `comotion-vadim` repo (naming
 convention: `vadim/data/conflict-records/full-pool/n<N>_seed<S>/

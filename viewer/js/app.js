@@ -1510,11 +1510,12 @@ let selectedConflictRowEl = null;
  */
 async function fetchConflictRecordsForFolder(folder) {
   const MAX_CONFLICTS_PROBED = 5000;
-  const records = [];
+  const entries = [];
   for (let i = 1; i <= MAX_CONFLICTS_PROBED; i++) {
+    const url = `${folder}conflict_${i}.json`;
     let response;
     try {
-      response = await fetch(`${folder}conflict_${i}.json`);
+      response = await fetch(url);
     } catch (err) {
       break; // network error — folder unreachable, stop rather than retry forever
     }
@@ -1526,9 +1527,9 @@ async function fetchConflictRecordsForFolder(folder) {
       break; // not JSON — treat like "not found"
     }
     if (!isWellFormedConflictRecord(record)) break;
-    records.push(record);
+    entries.push({ record, url });
   }
-  return records;
+  return entries;
 }
 
 function clearConflictPanelRows() {
@@ -1556,12 +1557,29 @@ function selectConflictRow(record, rowEl) {
   }
 }
 
-function addConflictPanelRow(record) {
+function addConflictPanelRow({ record, url }) {
   const rows = document.getElementById("conflict-rows");
   if (!rows) return;
   const row = document.createElement("div");
   row.className = "conflict-row";
-  row.textContent = conflictSummaryLine(record);
+
+  const label = document.createElement("span");
+  label.className = "conflict-row-label";
+  label.textContent = conflictSummaryLine(record);
+  row.appendChild(label);
+
+  const link = document.createElement("a");
+  link.className = "conflict-row-link";
+  link.href = `conflict.html?file=${encodeURIComponent(url)}`;
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.title = "Open full conflict record in a new tab";
+  link.textContent = "↗";
+  // Opening the detail page is independent of selecting the row in the
+  // main viewer — don't also trigger the row's own click (timestep jump).
+  link.addEventListener("click", (event) => event.stopPropagation());
+  row.appendChild(link);
+
   row.addEventListener("click", () => selectConflictRow(record, row));
   rows.appendChild(row);
 }

@@ -80,11 +80,18 @@
     #conflicts-panel[hidden] { display: none; }
     #conflicts-panel h4 { margin: 0 0 6px 0; font-size: 12px; font-weight: 600; color: #555; }
     .conflict-row {
+      display: flex; align-items: center; gap: 6px;
       padding: 4px 6px; cursor: pointer; border-radius: 4px; font-size: 12px;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .conflict-row:hover { background: rgba(33,150,243,0.1); }
     .conflict-row.selected { background: rgba(33,150,243,0.22); font-weight: 600; }
+    .conflict-row-label {
+      flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .conflict-row-link {
+      flex: none; color: #2196f3; text-decoration: none; font-size: 13px; padding: 0 2px;
+    }
+    .conflict-row-link:hover { text-decoration: underline; }
     #conflict-detail {
       margin-top: 8px; padding-top: 8px; border-top: 1px solid #e0e0e0;
       font-size: 11px; color: #444; line-height: 1.5;
@@ -208,6 +215,6 @@
     }
   }
   </script>
-  <script type="module" src="js/app.js?v=32"></script>
+  <script type="module" src="js/app.js?v=33"></script>
 </body>
 </html>
