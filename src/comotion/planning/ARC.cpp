@@ -1129,7 +1129,7 @@ void ARC::captureSubproblemRecord(const SubproblemConflict &conflict,
     }
 
     std::vector<std::optional<SubproblemRecordCspaceBounds>> cspace_bounds;
-    if (search.found) {
+    if (search.found && use_cspace_bounds_) {
         const bool temporal_full_window_at_valid = isTemporalFullWindow(
             search.begin_t, search.end_t, horizon.max_t);
         cspace_bounds = computeSubproblemCspaceBounds(
