@@ -11,6 +11,7 @@ import {
   buildArcTimeline,
   configAtPath,
   conflictRobots,
+  findArcTimelineIndexForConflict,
   firstReachedConflict,
 } from "./arc-playback.js";
 import {
@@ -1557,12 +1558,50 @@ function clearConflictPanelRows() {
   if (detail) detail.replaceChildren();
 }
 
-function selectConflictRow(record, rowEl) {
+/**
+ * Jump the main viewer to a clicked conflict's raw, pre-repair collision.
+ *
+ * record.seed_conflict.conflict_timestep is a raw per-robot path
+ * timestep, valid as-is only in "Solution path" mode (where
+ * currentTimestep indexes robots[i].path[] directly) -- and even there it
+ * shows the FINAL/fully-repaired path at that time, not the original
+ * collision, since a robot's solved path can differ from what it looked
+ * like when this specific conflict was detected. When ARC-process history
+ * is available, findArcTimelineIndexForConflict() (js/arc-playback.js)
+ * translates (conflict_sequence_index - 1, conflict_timestep) into the
+ * correct global arcTimeline index showing that exact moment -- verified
+ * against real data to reproduce seed_conflict.config_i/config_j exactly.
+ */
+function timestepForConflict(record) {
+  const conflictTimestep = record.seed_conflict.conflict_timestep;
+  if (arcTimeline.length === 0) {
+    // No ARC history at all for this result (e.g. an N=64 run) -- only
+    // Solution path mode exists, where conflict_timestep is already the
+    // right index.
+    return conflictTimestep;
+  }
+  const iterationIndex = record.provenance.conflict_sequence_index - 1;
+  const target = findArcTimelineIndexForConflict(arcTimeline, iterationIndex, conflictTimestep);
+  if (target === -1) {
+    console.warn(
+      `Conflict #${record.provenance.conflict_sequence_index}: no ARC ` +
+      `frame found for iteration ${iterationIndex} at t=${conflictTimestep} ` +
+      "-- falling back to the raw timestep, which will likely be wrong."
+    );
+    return conflictTimestep;
+  }
+  return target;
+}
+
+async function selectConflictRow(record, rowEl) {
   if (selectedConflictRowEl) selectedConflictRowEl.classList.remove("selected");
   rowEl.classList.add("selected");
   selectedConflictRowEl = rowEl;
 
-  setTimestep(record.seed_conflict.conflict_timestep);
+  // Always show the actual raw conflict when ARC history exists, even if
+  // currently viewing "Solution path" mode.
+  if (arcTimeline.length > 0 && playbackMode !== "arc") setPlaybackMode("arc");
+  await setTimestep(timestepForConflict(record));
 
   const detail = document.getElementById("conflict-detail");
   if (!detail) return;

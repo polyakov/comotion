@@ -93,12 +93,47 @@ function firstReachedConflict(iteration, robotIndex, timestep) {
   }, null);
 }
 
+/**
+ * Global arcTimeline index of the "paths"-phase frame showing a raw
+ * conflict-record's exact colliding configuration, or -1 if none matches.
+ *
+ * `iterationIndex`/`timestep` here are NOT interchangeable with a
+ * conflict-record's own `conflict_sequence_index`/`conflict_timestep`
+ * without translation first: `iterationIndex` is
+ * `conflict_sequence_index - 1` (each ARC-history iteration corresponds
+ * to exactly one detected-and-resolved conflict, in order — verified
+ * against real data: iteration N's "paths" phase at its recorded
+ * conflict's timestep reproduces that conflict's config_i/config_j
+ * exactly), and `timestep` is the record's `conflict_timestep` as-is
+ * (a "paths"-phase frame's local `timestep` field already IS the raw
+ * per-robot path timestep — see buildArcTimeline()). The bug this fixes:
+ * arcTimeline's *global* array index is a different, non-interchangeable
+ * number from either of those — every iteration's "paths" phase restarts
+ * its local `timestep` count at 0, so naively passing a raw
+ * `conflict_timestep` straight to setTimestep() only ever lands correctly
+ * by coincidence, for a conflict inside iteration 0.
+ */
+function findArcTimelineIndexForConflict(arcTimeline, iterationIndex, timestep) {
+  for (let i = 0; i < arcTimeline.length; i++) {
+    const frame = arcTimeline[i];
+    if (
+      frame.iterationIndex === iterationIndex &&
+      frame.phase === "paths" &&
+      frame.timestep === timestep
+    ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 export {
   ARC_CONFLICT_HOLD_TIMESTEPS,
   arcFrameDurationTimesteps,
   buildArcTimeline,
   configAtPath,
   conflictRobots,
+  findArcTimelineIndexForConflict,
   firstReachedConflict,
   hasArcVisualization,
 };
