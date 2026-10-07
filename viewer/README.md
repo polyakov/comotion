@@ -59,6 +59,34 @@ both history flags when creating the result:
 Loading the result selects ARC process mode automatically. Use the **Mode**
 selector to switch between the ARC process and final path.
 
+### Large results: chunked ARC history
+
+`--track-arc-history` results scale with both robot count and conflict
+count (each iteration snapshots every robot's full path so far), and can
+exceed the browser's ~512MB single-string limit — at which point the
+viewer cannot load the file **at all**, not just slowly. `vadim/scripts/
+chunk_viewer_result.py` splits an existing `_result.json`'s
+`arc_visualization.iterations` into several sibling chunk files plus a
+small `*.chunked.json` base file carrying a manifest:
+
+```bash
+python3 vadim/scripts/chunk_viewer_result.py path/to/..._ARC_result.json
+```
+
+Non-destructive — the original file is untouched. Load the `.chunked.json`
+file via `?file=...` exactly like any other result. The viewer loads
+chunks **on demand**: only a sliding window of 3 chunks (the one covering
+the current frame, plus one on each side) is ever fetched/resident at
+once, fetched as playback or scrubbing moves and evicted once left
+behind — so opening even a huge episode is near-instant regardless of its
+total chunk count, and scrubbing to any point fetches only what that
+point needs, not everything before it. **Chunked results can only be
+loaded via `?file=`, not the local file picker** — browsers don't allow
+JS to read sibling files from a local file selection, so the file
+picker loads a chunked result with a warning and no ARC-process history.
+See `vadim/requirements/viewer_result_chunking.md` for the full design
+and file format.
+
 ## Planned Paths
 
 Check **Show planned paths** in the toolbar to draw each sphere robot's
@@ -128,6 +156,40 @@ not a per-timestep or per-ARC-iteration artifact), so it doesn't change
 between **Solution path** and **ARC process** modes. Changing **Palette**
 re-colors any roadmaps already on screen. Loading a new result file rebuilds
 the panel from scratch and resets every checkbox to unchecked.
+
+## Conflicts
+
+For `mobile_robot_2d_crossing` results, loading a result shows a
+**Conflicts** panel (top-left) listing every raw `SubproblemRecord`
+conflict captured for that exact run (same `--num-robots`/`--seed`) by the
+`--conflict-record-dir` flag — see
+`comotion-vadim/requirements/data-collection/subproblem-record-design.md`
+for the record schema and `comotion-vadim/data/conflict-records/` for the
+existing corpus. The panel is absent entirely (not just empty) when the
+loaded result isn't a recognizable `mobile_robot_2d_crossing` run, or when
+no matching conflict-record folder exists for its exact `--num-robots`/
+`--seed` (e.g. a run captured without `--conflict-record-dir`).
+
+Each row is a one-line summary (e.g. `#65 — 17 robots (seed 14,26) @
+t=7377`); clicking it jumps the main timeline to that conflict's
+`conflict_timestep` and shows an expanded detail readout below the list
+(robots involved, seed pair, raw/valid window bounds, run provenance).
+Navigating this way only moves the timestep — it does not switch playback
+mode or highlight the involved robots.
+
+Each row also has a small ↗ link that opens `conflict.html` in a new tab,
+showing that conflict's full record: a one-line summary plus the raw JSON,
+pretty-printed. It's deliberately a plain JSON dump for now (a starting
+point, not a finished detail view) and is independent of the row's own
+click — opening it doesn't move the main viewer's timestep.
+
+This reads conflict-record JSON files directly from disk via the
+`comotion/vadim` symlink to the sibling `comotion-vadim` repo (naming
+convention: `vadim/data/conflict-records/full-pool/n<N>_seed<S>/
+conflict_<sequence>.json`, matching the same `n<N>_seed<S>` naming
+`outputBasename()` already embeds in every `mobile_robot_2d_crossing`
+result filename) — so this only works when serving from the `comotion/`
+repo root as described above, with that symlink present.
 
 ## Controls
 

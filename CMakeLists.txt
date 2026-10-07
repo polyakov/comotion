@@ -78,6 +78,15 @@ if(COMOTION_BUILD_EXAMPLES)
   add_subdirectory(examples)
 endif()
 
+# Optional dev-local `vadim/` tooling tree (see
+# steps/07-subproblem-solution-harness.md's "or new vadim/-scoped harness
+# binary" deliverable). `vadim` is gitignored here and typically a symlink
+# into a separate checkout, so this is guarded rather than unconditional --
+# checkouts without it configure identically to before.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vadim/CMakeLists.txt")
+  add_subdirectory(vadim)
+endif()
+
 if(COMOTION_BUILD_TESTS)
     enable_testing()
 
